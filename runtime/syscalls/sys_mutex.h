@@ -70,6 +70,10 @@ typedef struct sys_mutex_info {
 
 extern sys_mutex_info g_sys_mutexes[SYS_MUTEX_MAX];
 
+/* Successful kernel mutex acquisitions held by this host PPU thread.
+ * Used only to defer cooperative callbacks, never to decide guest locking. */
+unsigned sys_mutex_current_thread_lock_count(void);
+
 /* Syscall handlers */
 int64_t sys_mutex_create(ppu_context* ctx);
 int64_t sys_mutex_destroy(ppu_context* ctx);

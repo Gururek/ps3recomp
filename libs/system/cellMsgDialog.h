@@ -36,16 +36,16 @@ extern "C" {
 #define CELL_MSGDIALOG_TYPE_PROGRESSBAR_DOUBLE     0x00002000
 
 /* Button results */
-#define CELL_MSGDIALOG_BUTTON_NONE     0
-#define CELL_MSGDIALOG_BUTTON_INVALID  (-1)
+#define CELL_MSGDIALOG_BUTTON_NONE     (-1)
+#define CELL_MSGDIALOG_BUTTON_INVALID  0
 #define CELL_MSGDIALOG_BUTTON_OK       1
 #define CELL_MSGDIALOG_BUTTON_YES      1
 #define CELL_MSGDIALOG_BUTTON_NO       2
 #define CELL_MSGDIALOG_BUTTON_ESCAPE   3
 
 /* Error codes */
-#define CELL_MSGDIALOG_ERROR_PARAM         (s32)(CELL_ERROR_BASE_SYSUTIL | 0x01)
-#define CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED (s32)(CELL_ERROR_BASE_SYSUTIL | 0x10)
+#define CELL_MSGDIALOG_ERROR_PARAM             (s32)0x8002B301u
+#define CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED (s32)0x8002B302u
 
 /* ---------------------------------------------------------------------------
  * Types
@@ -67,6 +67,9 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
 s32 cellMsgDialogClose(float delayMs);
 
 s32 cellMsgDialogAbort(void);
+
+/* Host-side helper: dispatch queued dialog callbacks during sysutil polling. */
+void cellMsgDialogDispatchPending(void);
 
 s32 cellMsgDialogProgressBarSetMsg(u32 progressBarIndex, const char* msgString);
 

@@ -69,40 +69,50 @@ typedef struct CellAudioPortConfig {
  * Functions
  * -----------------------------------------------------------------------*/
 
+/* Host integration hook: select a 1 MB-aligned guest arena before Init().
+ * Titles can reserve 0x01000000 for their own descriptors or mapped data. */
+void cellAudioSetGuestMemoryBase(u32 base);
+
 /* NID: 0x0B168F92 */
 s32 cellAudioInit(void);
 
-/* NID: 0x4129FE2D */
+/* NID: 0xCA5AC370 */
 s32 cellAudioQuit(void);
 
 /* NID: 0xCD7BC431 */
 s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum);
 
-/* NID: 0x56DFFE09 */
+/* NID: 0x4129FE2D */
 s32 cellAudioPortClose(u32 portNum);
 
-/* NID: 0x04AF134E */
+/* NID: 0x89BE28F2 */
 s32 cellAudioPortStart(u32 portNum);
 
-/* NID: 0x05DEAB16 */
+/* NID: 0x5B1E2C73 */
 s32 cellAudioPortStop(u32 portNum);
 
-/* NID: 0x74A66AF0 */
+/* NID: 0x377E0CD9 */
 s32 cellAudioSetNotifyEventQueue(u64 key);
 
-/* NID: 0x02B9B9F8 */
+/* NID: 0xFF3626FD */
 s32 cellAudioRemoveNotifyEventQueue(u64 key);
 
-/* NID: 0x4109D08C */
+/* NID: 0x74A66AF0 */
 s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config);
 
-/* NID: 0x7EECFF1D */
+/* NID: 0x4109D08C */
+s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp);
+
+/* NID: 0xE4046AFE */
+s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
+
+/* NID: 0xB8EF8006 */
 s32 cellAudioPortGetStatus(u32 portNum, u32* status);
 
-/* NID: 0x3EEFAF96 */
+/* NID: 0x5676F81C */
 s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 
-/* NID: 0x96A7B2F4 */
+/* NID: 0x28BC1409 */
 s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream);
 
 #ifdef __cplusplus

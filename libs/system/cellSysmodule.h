@@ -111,6 +111,7 @@ extern "C" {
 #define CELL_SYSMODULE_ADEC_M4AAC           0xF01D
 #define CELL_SYSMODULE_IMEJP                0xF023
 #define CELL_SYSMODULE_SYSUTIL_NP_TROPHY    0xF035
+#define CELL_SYSMODULE_SYSUTIL_NP_EULA      0xF044
 
 /* Aliases used in game code */
 #define CELL_SYSMODULE_GCM          CELL_SYSMODULE_GCM_SYS
@@ -126,9 +127,11 @@ extern "C" {
 s32 cellSysmoduleInitialize(void);
 s32 cellSysmoduleFinalize(void);
 s32 cellSysmoduleLoadModule(u16 id);
+s32 cellSysmoduleLoadModuleEx(u16 id);
 
 /* NID: 0x112A5EE9 */
 s32 cellSysmoduleUnloadModule(u16 id);
+s32 cellSysmoduleUnloadModuleEx(u16 id);
 
 /* NID: 0x5A59E258 */
 s32 cellSysmoduleIsLoaded(u16 id);

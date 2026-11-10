@@ -306,7 +306,8 @@ s32 cellRtcTickAddDays(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd)
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
-    pTick0->tick = pTick1->tick + (s64)iAdd * 24LL * 3600LL * USEC_PER_SEC;
+    rtc_tick_write(pTick0, rtc_tick_read(pTick1) +
+                   (s64)iAdd * 24LL * 3600LL * USEC_PER_SEC);
     return CELL_OK;
 }
 
@@ -315,7 +316,8 @@ s32 cellRtcTickAddHours(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
-    pTick0->tick = pTick1->tick + (s64)iAdd * 3600LL * USEC_PER_SEC;
+    rtc_tick_write(pTick0, rtc_tick_read(pTick1) +
+                   (s64)iAdd * 3600LL * USEC_PER_SEC);
     return CELL_OK;
 }
 
@@ -324,7 +326,8 @@ s32 cellRtcTickAddMinutes(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iA
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
-    pTick0->tick = pTick1->tick + (s64)iAdd * 60LL * USEC_PER_SEC;
+    rtc_tick_write(pTick0, rtc_tick_read(pTick1) +
+                   (s64)iAdd * 60LL * USEC_PER_SEC);
     return CELL_OK;
 }
 
@@ -333,7 +336,8 @@ s32 cellRtcTickAddSeconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s64 iA
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
-    pTick0->tick = pTick1->tick + iAdd * (s64)USEC_PER_SEC;
+    rtc_tick_write(pTick0, rtc_tick_read(pTick1) +
+                   iAdd * (s64)USEC_PER_SEC);
     return CELL_OK;
 }
 
@@ -342,7 +346,7 @@ s32 cellRtcTickAddMicroseconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
-    pTick0->tick = pTick1->tick + iAdd;
+    rtc_tick_write(pTick0, rtc_tick_read(pTick1) + iAdd);
     return CELL_OK;
 }
 
@@ -366,7 +370,8 @@ s32 cellRtcConvertLocalTimeToUtc(const CellRtcTick* pLocalTime, CellRtcTick* pUt
     time_t utc_t   = mktime(&utc_tm);
     s64 offset_sec = (s64)(local_t - utc_t);
 
-    pUtc->tick = pLocalTime->tick - (u64)(offset_sec * (s64)USEC_PER_SEC);
+    rtc_tick_write(pUtc, rtc_tick_read(pLocalTime) -
+                   (u64)(offset_sec * (s64)USEC_PER_SEC));
     return CELL_OK;
 }
 
@@ -389,7 +394,8 @@ s32 cellRtcConvertUtcToLocalTime(const CellRtcTick* pUtc, CellRtcTick* pLocalTim
     time_t utc_t   = mktime(&utc_tm);
     s64 offset_sec = (s64)(local_t - utc_t);
 
-    pLocalTime->tick = pUtc->tick + (u64)(offset_sec * (s64)USEC_PER_SEC);
+    rtc_tick_write(pLocalTime, rtc_tick_read(pUtc) +
+                   (u64)(offset_sec * (s64)USEC_PER_SEC));
     return CELL_OK;
 }
 
@@ -399,7 +405,7 @@ s32 cellRtcFormatRfc2822(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZ
         return CELL_EINVAL;
 
     /* Convert tick to time_t, apply timezone offset */
-    s64 unix_time = tick_to_time_t(pTick->tick);
+    s64 unix_time = tick_to_time_t(rtc_tick_read(pTick));
     unix_time += (s64)iTimeZoneMinutes * 60;
 
     time_t t = (time_t)unix_time;
@@ -432,7 +438,7 @@ s32 cellRtcFormatRfc3339(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZ
     if (!pszDateTime || !pTick)
         return CELL_EINVAL;
 
-    s64 unix_time = tick_to_time_t(pTick->tick);
+    s64 unix_time = tick_to_time_t(rtc_tick_read(pTick));
     unix_time += (s64)iTimeZoneMinutes * 60;
 
     time_t t = (time_t)unix_time;

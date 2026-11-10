@@ -82,20 +82,16 @@ typedef struct CellFsStat {
     u64  st_blksize;
 } CellFsStat;
 
-typedef struct CellFsDirectoryEntry {
-    CellFsStat attribute;
-    char       entry_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH];
-} CellFsDirectoryEntry;
-#pragma pack(pop)
-
-/* cellFsReaddir writes this compact dirent. CellFsDirectoryEntry is the
- * separate stat-carrying shape used by cellFsGetDirectoryEntries. */
-#pragma pack(push, 1)
 typedef struct CellFsDirent {
     u8   d_type;
     u8   d_namlen;
     char d_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH];
 } CellFsDirent;
+
+typedef struct CellFsDirectoryEntry {
+    CellFsStat   attribute;
+    CellFsDirent entry_name;
+} CellFsDirectoryEntry;
 #pragma pack(pop)
 
 #define CELL_FS_TYPE_UNKNOWN       0
@@ -105,8 +101,10 @@ typedef struct CellFsDirent {
 
 #ifdef __cplusplus
 static_assert(sizeof(CellFsDirent) == 258, "CellFsDirent ABI size");
+static_assert(sizeof(CellFsDirectoryEntry) == 312, "CellFsDirectoryEntry ABI size");
 #else
 _Static_assert(sizeof(CellFsDirent) == 258, "CellFsDirent ABI size");
+_Static_assert(sizeof(CellFsDirectoryEntry) == 312, "CellFsDirectoryEntry ABI size");
 #endif
 
 /* Opaque file/directory descriptors */

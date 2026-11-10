@@ -29,17 +29,22 @@ extern "C" {
 #define RSX_TEXTURE_DEPTH24_D8_FLOAT 0x91
 #define RSX_TEXTURE_DEPTH16          0x92
 #define RSX_TEXTURE_DEPTH16_FLOAT    0x93
-#define RSX_TEXTURE_X16              0x94  /* float16 single channel */
-#define RSX_TEXTURE_Y16_X16          0x95  /* float16 two channels */
+#define RSX_TEXTURE_X16              0x94  /* unsigned-normalized 16-bit channel */
+#define RSX_TEXTURE_Y16_X16          0x95  /* two unsigned-normalized 16-bit channels */
 #define RSX_TEXTURE_R5G5B5A1         0x97
+#define RSX_TEXTURE_COMPRESSED_HILO8    0x98
+#define RSX_TEXTURE_COMPRESSED_HILO_S8 0x99
 #define RSX_TEXTURE_W16_Z16_Y16_X16_FLOAT 0x9A
 #define RSX_TEXTURE_W32_Z32_Y32_X32_FLOAT 0x9B
 #define RSX_TEXTURE_X32_FLOAT        0x9C
 #define RSX_TEXTURE_D1R5G5B5         0x9D
 #define RSX_TEXTURE_D8R8G8B8         0x9E
 #define RSX_TEXTURE_Y16_X16_FLOAT    0x9F
-#define RSX_TEXTURE_COMPRESSED_B8R8_G8R8 0xAD
-#define RSX_TEXTURE_COMPRESSED_R8B8_R8G8 0xAE
+/* Firmware spells the following linear formats 0xAD/0xAE because bit 0x20
+ * is CELL_GCM_TEXTURE_LN. Their base formats after stripping flags are
+ * 0x8D/0x8E. */
+#define RSX_TEXTURE_COMPRESSED_B8R8_G8R8 0x8D
+#define RSX_TEXTURE_COMPRESSED_R8B8_R8G8 0x8E
 
 /* Extract the base format from the full texture format word.
  * The format field is in bits 8-15 of the NV4097_SET_TEXTURE_FORMAT register. */
@@ -64,6 +69,12 @@ static inline u32 rsx_texture_bpp(u32 format)
     case RSX_TEXTURE_R5G6B5:        return 16;
     case RSX_TEXTURE_A8R8G8B8:      return 32;
     case RSX_TEXTURE_G8B8:          return 16;
+    case RSX_TEXTURE_R6G5B5:        return 16;
+    case RSX_TEXTURE_R5G5B5A1:      return 16;
+    case RSX_TEXTURE_COMPRESSED_HILO8:
+    case RSX_TEXTURE_COMPRESSED_HILO_S8: return 16;
+    case RSX_TEXTURE_D1R5G5B5:      return 16;
+    case RSX_TEXTURE_D8R8G8B8:      return 32;
     case RSX_TEXTURE_X16:           return 16;
     case RSX_TEXTURE_Y16_X16:       return 32;
     case RSX_TEXTURE_Y16_X16_FLOAT: return 32;
@@ -77,6 +88,8 @@ static inline u32 rsx_texture_bpp(u32 format)
     case RSX_TEXTURE_COMPRESSED_DXT1:  return 4; /* per texel average */
     case RSX_TEXTURE_COMPRESSED_DXT23: return 8;
     case RSX_TEXTURE_COMPRESSED_DXT45: return 8;
+    case RSX_TEXTURE_COMPRESSED_B8R8_G8R8: return 16;
+    case RSX_TEXTURE_COMPRESSED_R8B8_R8G8: return 16;
     default:                         return 32;
     }
 }
@@ -84,12 +97,16 @@ static inline u32 rsx_texture_bpp(u32 format)
 /* DXGI format constants (subset needed for texture mapping) */
 #define DXGI_FORMAT_R8_UNORM_TEX         61
 #define DXGI_FORMAT_R8G8_UNORM_TEX       49
+#define DXGI_FORMAT_R8G8_SNORM_TEX       51
+#define DXGI_FORMAT_R8G8B8A8_UNORM_TEX   28
 #define DXGI_FORMAT_B8G8R8A8_UNORM       87
 #define DXGI_FORMAT_B5G5R5A1_UNORM       86
 #define DXGI_FORMAT_B5G6R5_UNORM         85
 #define DXGI_FORMAT_B4G4R4A4_UNORM       115
 #define DXGI_FORMAT_R16_FLOAT_TEX        54
+#define DXGI_FORMAT_R16_UNORM_TEX        56
 #define DXGI_FORMAT_R16G16_FLOAT_TEX     34
+#define DXGI_FORMAT_R16G16_UNORM_TEX     35
 #define DXGI_FORMAT_R16G16B16A16_FLOAT_TEX 10
 #define DXGI_FORMAT_R32_FLOAT_TEX        41
 #define DXGI_FORMAT_R32G32B32A32_FLOAT_TEX 2
@@ -106,14 +123,22 @@ static inline u32 rsx_to_dxgi_texture_format(u32 rsx_format)
     switch (rsx_format) {
     case RSX_TEXTURE_B8:             return DXGI_FORMAT_R8_UNORM_TEX;
     case RSX_TEXTURE_G8B8:           return DXGI_FORMAT_R8G8_UNORM_TEX;
-    case RSX_TEXTURE_A8R8G8B8:       return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case RSX_TEXTURE_D8R8G8B8:       return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case RSX_TEXTURE_A1R5G5B5:       return DXGI_FORMAT_B5G5R5A1_UNORM;
-    case RSX_TEXTURE_R5G5B5A1:       return DXGI_FORMAT_B5G5R5A1_UNORM;
-    case RSX_TEXTURE_R5G6B5:         return DXGI_FORMAT_B5G6R5_UNORM;
-    case RSX_TEXTURE_A4R4G4B4:       return DXGI_FORMAT_B4G4R4A4_UNORM;
-    case RSX_TEXTURE_X16:            return DXGI_FORMAT_R16_FLOAT_TEX;
-    case RSX_TEXTURE_Y16_X16:        return DXGI_FORMAT_R16G16_FLOAT_TEX;
+    case RSX_TEXTURE_COMPRESSED_HILO8:    return DXGI_FORMAT_R8G8_UNORM_TEX;
+    case RSX_TEXTURE_COMPRESSED_HILO_S8: return DXGI_FORMAT_R8G8_SNORM_TEX;
+    case RSX_TEXTURE_A8R8G8B8:       return DXGI_FORMAT_R8G8B8A8_UNORM_TEX;
+    /* Packed color formats are normalized to canonical RGBA8 during upload. */
+    case RSX_TEXTURE_D8R8G8B8:
+    case RSX_TEXTURE_A1R5G5B5:
+    case RSX_TEXTURE_R5G5B5A1:
+    case RSX_TEXTURE_R5G6B5:
+    case RSX_TEXTURE_R6G5B5:
+    case RSX_TEXTURE_D1R5G5B5:
+    case RSX_TEXTURE_A4R4G4B4:
+    case RSX_TEXTURE_COMPRESSED_B8R8_G8R8:
+    case RSX_TEXTURE_COMPRESSED_R8B8_R8G8:
+        return DXGI_FORMAT_R8G8B8A8_UNORM_TEX;
+    case RSX_TEXTURE_X16:            return DXGI_FORMAT_R16_UNORM_TEX;
+    case RSX_TEXTURE_Y16_X16:        return DXGI_FORMAT_R16G16_UNORM_TEX;
     case RSX_TEXTURE_Y16_X16_FLOAT:  return DXGI_FORMAT_R16G16_FLOAT_TEX;
     case RSX_TEXTURE_W16_Z16_Y16_X16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT_TEX;
     case RSX_TEXTURE_X32_FLOAT:      return DXGI_FORMAT_R32_FLOAT_TEX;
@@ -121,8 +146,11 @@ static inline u32 rsx_to_dxgi_texture_format(u32 rsx_format)
     case RSX_TEXTURE_COMPRESSED_DXT1:  return DXGI_FORMAT_BC1_UNORM;
     case RSX_TEXTURE_COMPRESSED_DXT23: return DXGI_FORMAT_BC2_UNORM;
     case RSX_TEXTURE_COMPRESSED_DXT45: return DXGI_FORMAT_BC3_UNORM;
-    case RSX_TEXTURE_DEPTH16:        return DXGI_FORMAT_D16_UNORM;
-    case RSX_TEXTURE_DEPTH24_D8:     return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    /* Sampled depth uploads are color resources, not DSV-only resources. */
+    case RSX_TEXTURE_DEPTH16:        return DXGI_FORMAT_R16_UNORM_TEX;
+    case RSX_TEXTURE_DEPTH16_FLOAT:  return DXGI_FORMAT_R32_FLOAT_TEX;
+    case RSX_TEXTURE_DEPTH24_D8:     return DXGI_FORMAT_R32_FLOAT_TEX;
+    case RSX_TEXTURE_DEPTH24_D8_FLOAT: return DXGI_FORMAT_R32_FLOAT_TEX;
     default:                          return 0;
     }
 }

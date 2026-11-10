@@ -21,10 +21,19 @@ extern "C" {
 #define CELL_AUDIO_OUT_PRIMARY             0
 #define CELL_AUDIO_OUT_SECONDARY           1
 
+/* Official cellAudioOut errors. */
+#define CELL_AUDIO_OUT_ERROR_ILLEGAL_CONFIGURATION  0x8002B241
+#define CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER      0x8002B242
+#define CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE 0x8002B243
+#define CELL_AUDIO_OUT_ERROR_DEVICE_NOT_FOUND       0x8002B244
+#define CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT  0x8002B245
+#define CELL_AUDIO_OUT_ERROR_UNSUPPORTED_SOUND_MODE 0x8002B246
+#define CELL_AUDIO_OUT_ERROR_CONDITION_BUSY           0x8002B247
+
 /* Output modes */
 #define CELL_AUDIO_OUT_CODING_TYPE_LPCM    0
-#define CELL_AUDIO_OUT_CODING_TYPE_AC3     4
-#define CELL_AUDIO_OUT_CODING_TYPE_DTS     8
+#define CELL_AUDIO_OUT_CODING_TYPE_AC3     1
+#define CELL_AUDIO_OUT_CODING_TYPE_DTS     6
 
 /* Channel counts */
 #define CELL_AUDIO_OUT_CHNUM_2             2
@@ -40,6 +49,11 @@ extern "C" {
 #define CELL_AUDIO_OUT_FS_176KHZ           0x20
 #define CELL_AUDIO_OUT_FS_192KHZ           0x40
 
+/* Speaker layouts returned by the firmware device list. */
+#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH          0x00000001
+#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr   0x00010000
+#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_8CH_LREClrxy 0x40000000
+
 /* ---------------------------------------------------------------------------
  * Types
  * -----------------------------------------------------------------------*/
@@ -49,6 +63,7 @@ typedef struct CellAudioOutSoundMode {
     u8  channel;
     u8  fs;
     u8  reserved;
+    u32 layout;
 } CellAudioOutSoundMode;
 
 typedef struct CellAudioOutDeviceInfo {
@@ -56,6 +71,7 @@ typedef struct CellAudioOutDeviceInfo {
     u8  availableModeCount;
     u8  state;
     u8  reserved[3];
+    u16 latency;
     CellAudioOutSoundMode availableModes[16];
 } CellAudioOutDeviceInfo;
 
@@ -78,6 +94,8 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
 s32 cellAudioOutGetConfiguration(u32 audioOut,
                                   CellAudioOutConfiguration* config,
                                   void* option, u32 optionSize);
+s32 cellAudioOutConfigure(u32 audioOut, CellAudioOutConfiguration* config,
+                          void* option, u32 waitForEvent);
 s32 cellAudioOutSetCopyControl(u32 audioOut, u32 control);
 
 /* HDMI/display audio */

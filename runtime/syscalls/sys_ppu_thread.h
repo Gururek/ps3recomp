@@ -46,7 +46,9 @@ typedef struct ppu_thread_info {
     char         name[64];
     int32_t      priority;
     int64_t      exit_status;
+    int          exit_requested;
     int          joinable;
+    int          join_claimed;
     uint32_t     stack_addr;   /* guest stack base */
     uint32_t     stack_size;
     uint64_t     entry_addr;   /* guest entry point */
@@ -89,6 +91,12 @@ int64_t sys_ppu_thread_create(ppu_context* ctx);
  * Call before the first sys_ppu_thread_create so no created thread aliases
  * main (thread_id 0 broke every owner-tracking sync primitive). */
 uint64_t ppu_thread_register_main(void);
+uint32_t ppu_thread_allocate_guest_stack(uint32_t stack_size);
+#ifdef _WIN32
+/* Caller owns returned handle. Only duplicates a RUNNING worker while holding
+ * the thread-table lock, then rejects a handle that exited during duplication. */
+HANDLE ppu_thread_duplicate_live_worker(unsigned thread_id);
+#endif
 int64_t sys_ppu_thread_exit(ppu_context* ctx);
 int64_t sys_ppu_thread_join(ppu_context* ctx);
 int64_t sys_ppu_thread_detach(ppu_context* ctx);

@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include "../../runtime/ppu/ppu_memory.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -140,6 +141,12 @@ typedef struct {
 static HeapSlot s_heaps[MAX_HEAPS];
 static u32 s_next_heap_id = 1;
 
+/* Guest OPD addresses registered by libspurs for SPU printf lifecycle hooks. */
+u32 g_spu_printf_agcb = 0;
+u32 g_spu_printf_dgcb = 0;
+u32 g_spu_printf_atcb = 0;
+u32 g_spu_printf_dtcb = 0;
+
 /* ---------------------------------------------------------------------------
  * Thread management
  *
@@ -257,6 +264,26 @@ static int yz_format(char* out, size_t cap, const char* fmt, va_list ap)
     return (int)p;
 }
 
+s32 _sys_spu_printf_initialize(u32 agcb, u32 dgcb, u32 atcb, u32 dtcb)
+{
+    printf("[sysPrxForUser] _sys_spu_printf_initialize(%08X,%08X,%08X,%08X)\n",
+           agcb, dgcb, atcb, dtcb);
+    g_spu_printf_agcb = agcb;
+    g_spu_printf_dgcb = dgcb;
+    g_spu_printf_atcb = atcb;
+    g_spu_printf_dtcb = dtcb;
+    return CELL_OK;
+}
+
+s32 _sys_spu_printf_finalize(void)
+{
+    g_spu_printf_agcb = 0;
+    g_spu_printf_dgcb = 0;
+    g_spu_printf_atcb = 0;
+    g_spu_printf_dtcb = 0;
+    return CELL_OK;
+}
+
 s32 _sys_printf(const char* fmt, ...)
 {
     va_list ap; va_start(ap, fmt);
@@ -364,17 +391,35 @@ s32 _sys_tolower(s32 c) { return tolower(c); }
  * Lightweight mutex
  * -----------------------------------------------------------------------*/
 
-extern u8* vm_base;  /* for guest-address diagnostics in the boot log */
-#define YZ_GUEST_ADDR(p) ((u32)((u8*)(p) - vm_base))
+extern u8* vm_base;
+
+/* sysPrxForUser is reached through the generic HLE bridge, so pointer-shaped
+ * arguments are raw 32-bit guest effective addresses.  Keep the lwmutex ABI
+ * at that boundary instead of dereferencing those values as host pointers. */
+#define LWM_LOCK_VAR_OFF        0x00u
+#define LWM_ATTRIBUTE_OFF       0x08u
+#define LWM_RECURSIVE_COUNT_OFF 0x0Cu
+#define LWM_SLEEP_QUEUE_OFF     0x10u
+#define LWM_SIZE                0x18u
+
+static inline u32 lwm_ea(const sys_lwmutex_t_hle* p)
+{
+    return (u32)(uintptr_t)p;
+}
 
 s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
 {
+    const u32 mutex_ea = lwm_ea(lwmutex);
+    const u32 attr_ea = (u32)(uintptr_t)attr;
+    char attr_name[9] = {0};
+    if (attr_ea)
+        for (u32 i = 0; i < 8; ++i) attr_name[i] = (char)vm_read8(attr_ea + 8u + i);
     printf("[sysPrxForUser] sys_lwmutex_create(name='%.8s', guest=0x%08X)\n",
-           attr ? attr->name : "???", YZ_GUEST_ADDR(lwmutex));
+           attr_ea ? attr_name : "???", mutex_ea);
     { extern char* getenv(const char*); static int _lt=-1; if(_lt<0)_lt=getenv("FLOW_LWMTRACE")?1:0;
-      if(_lt){ extern unsigned int ppu_active_lr(void); printf("[LWMTRACE] create guest=0x%08X caller_lr=0x%08X\n", YZ_GUEST_ADDR(lwmutex), ppu_active_lr()); } }
+      if(_lt){ extern unsigned int ppu_active_lr(void); printf("[LWMTRACE] create guest=0x%08X caller_lr=0x%08X\n", mutex_ea, ppu_active_lr()); } }
 
-    if (!lwmutex)
+    if (!mutex_ea)
         return CELL_EFAULT;
 
     slot_lock();
@@ -384,9 +429,9 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
         if (!s_lwmutex[slot].in_use) {
             LwMutexSlot* m = &s_lwmutex[slot];
             m->in_use = 1;
-            m->recursive = (attr && (attr->recursive & SYS_SYNC_RECURSIVE)) ? 1 : 0;
-            if (attr)
-                memcpy(m->name, attr->name, 8);
+            m->recursive = (attr_ea &&
+                (vm_read32(attr_ea + 4u) & SYS_SYNC_RECURSIVE)) ? 1 : 0;
+            if (attr_ea) memcpy(m->name, attr_name, 8);
 
 #ifdef _WIN32
             InitializeCriticalSection(&m->cs);
@@ -399,8 +444,12 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
             pthread_mutexattr_destroy(&mattr);
 #endif
 
-            memset(lwmutex, 0, sizeof(*lwmutex));
-            lwmutex->sleep_queue = slot + 1; /* 1-based ID */
+            for (u32 off = 0; off < LWM_SIZE; off += 4)
+                vm_write32(mutex_ea + off, 0);
+            if (attr_ea)
+                vm_write32(mutex_ea + LWM_ATTRIBUTE_OFF,
+                           vm_read32(attr_ea + 4u));
+            vm_write32(mutex_ea + LWM_SLEEP_QUEUE_OFF, slot + 1); /* 1-based ID */
             s_lwmutex_next = (slot + 1) % MAX_LWMUTEX;
             slot_unlock();
             return CELL_OK;
@@ -413,20 +462,22 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
 s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 {
     (void)timeout;
-    if (!lwmutex) return CELL_EFAULT;
+    const u32 mutex_ea = lwm_ea(lwmutex);
+    if (!mutex_ea) return CELL_EFAULT;
 
-    u32 slot = lwmutex->sleep_queue - 1;
+    u32 sleep_queue = vm_read32(mutex_ea + LWM_SLEEP_QUEUE_OFF);
+    u32 slot = sleep_queue - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use) {
 #ifdef _WIN32
         printf("[sysPrxForUser] sys_lwmutex_lock FAIL guest=0x%08X "
                "sleep_queue=0x%08X (%s) [host tid %lu] -> ESRCH\n",
-               YZ_GUEST_ADDR(lwmutex), lwmutex->sleep_queue,
+               mutex_ea, sleep_queue,
                slot >= MAX_LWMUTEX ? "bad slot" : "slot not in use",
                GetCurrentThreadId());
 #else
         printf("[sysPrxForUser] sys_lwmutex_lock FAIL guest=0x%08X "
                "sleep_queue=0x%08X (%s) -> ESRCH\n",
-               YZ_GUEST_ADDR(lwmutex), lwmutex->sleep_queue,
+               mutex_ea, sleep_queue,
                slot >= MAX_LWMUTEX ? "bad slot" : "slot not in use");
 #endif
         { extern char* getenv(const char*); static int _lk=-1; if(_lk<0)_lk=getenv("FLOW_LOCKOK")?1:0;
@@ -437,7 +488,7 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 #ifdef _WIN32
     if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
         fprintf(stderr, "[LWMTX] tid %lu BLOCKING on lwmutex slot %u (guest 0x%08X)\n",
-                GetCurrentThreadId(), slot, YZ_GUEST_ADDR(lwmutex));
+                GetCurrentThreadId(), slot, mutex_ea);
         EnterCriticalSection(&s_lwmutex[slot].cs);
         fprintf(stderr, "[LWMTX] tid %lu acquired slot %u\n", GetCurrentThreadId(), slot);
     }
@@ -445,16 +496,18 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
     pthread_mutex_lock(&s_lwmutex[slot].mtx);
 #endif
 
-    lwmutex->lock_var = 1;
-    lwmutex->recursive_count++;
+    vm_write64(mutex_ea + LWM_LOCK_VAR_OFF, 1);
+    vm_write32(mutex_ea + LWM_RECURSIVE_COUNT_OFF,
+               vm_read32(mutex_ea + LWM_RECURSIVE_COUNT_OFF) + 1u);
     return CELL_OK;
 }
 
 s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
 {
-    if (!lwmutex) return CELL_EFAULT;
+    const u32 mutex_ea = lwm_ea(lwmutex);
+    if (!mutex_ea) return CELL_EFAULT;
 
-    u32 slot = lwmutex->sleep_queue - 1;
+    u32 slot = vm_read32(mutex_ea + LWM_SLEEP_QUEUE_OFF) - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use)
         return CELL_ESRCH;
 
@@ -466,22 +519,27 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
         return CELL_EBUSY;
 #endif
 
-    lwmutex->lock_var = 1;
-    lwmutex->recursive_count++;
+    vm_write64(mutex_ea + LWM_LOCK_VAR_OFF, 1);
+    vm_write32(mutex_ea + LWM_RECURSIVE_COUNT_OFF,
+               vm_read32(mutex_ea + LWM_RECURSIVE_COUNT_OFF) + 1u);
     return CELL_OK;
 }
 
 s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
 {
-    if (!lwmutex) return CELL_EFAULT;
+    const u32 mutex_ea = lwm_ea(lwmutex);
+    if (!mutex_ea) return CELL_EFAULT;
 
-    u32 slot = lwmutex->sleep_queue - 1;
+    u32 slot = vm_read32(mutex_ea + LWM_SLEEP_QUEUE_OFF) - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use)
         return CELL_ESRCH;
 
-    lwmutex->recursive_count--;
-    if (lwmutex->recursive_count == 0)
-        lwmutex->lock_var = 0;
+    u32 recursive_count = vm_read32(mutex_ea + LWM_RECURSIVE_COUNT_OFF);
+    if (!recursive_count) return CELL_EPERM;
+    recursive_count--;
+    vm_write32(mutex_ea + LWM_RECURSIVE_COUNT_OFF, recursive_count);
+    if (recursive_count == 0)
+        vm_write64(mutex_ea + LWM_LOCK_VAR_OFF, 0);
 
 #ifdef _WIN32
     LeaveCriticalSection(&s_lwmutex[slot].cs);
@@ -493,17 +551,18 @@ s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
 
 s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 {
+    const u32 mutex_ea = lwm_ea(lwmutex);
 #ifdef _WIN32
     printf("[sysPrxForUser] sys_lwmutex_destroy(guest=0x%08X) [host tid %lu]\n",
-           lwmutex ? YZ_GUEST_ADDR(lwmutex) : 0, GetCurrentThreadId());
+           mutex_ea, GetCurrentThreadId());
 #else
     printf("[sysPrxForUser] sys_lwmutex_destroy(guest=0x%08X)\n",
-           lwmutex ? YZ_GUEST_ADDR(lwmutex) : 0);
+           mutex_ea);
 #endif
 
-    if (!lwmutex) return CELL_EFAULT;
+    if (!mutex_ea) return CELL_EFAULT;
 
-    u32 slot = lwmutex->sleep_queue - 1;
+    u32 slot = vm_read32(mutex_ea + LWM_SLEEP_QUEUE_OFF) - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use) {
         printf("[sysPrxForUser] sys_lwmutex_destroy -> ESRCH\n");
         return CELL_ESRCH;   /* already destroyed / never created */
@@ -527,7 +586,8 @@ s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 #endif
     s_lwmutex[slot].in_use = 0;
 
-    memset(lwmutex, 0, sizeof(*lwmutex));
+    for (u32 off = 0; off < LWM_SIZE; off += 4)
+        vm_write32(mutex_ea + off, 0);
     printf("[sysPrxForUser] sys_lwmutex_destroy -> OK\n");
     return CELL_OK;
 }

@@ -13,9 +13,12 @@
  */
 
 #include "spu_dma.h"
-#include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
+#include "spu_workload.h"  /* queued SPURS task-signal delivery */
+#include "spu_reservation.h"
+#include "../../libs/spurs/spurs_taskset.h"
+#include "../../include/ps3emu/error_codes.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +35,37 @@ extern "C" {
 /* WWS code-buffer resolution probe counter (see spu_ls_write128 in spu_context.h). */
 int g_wws_code_probe = 0;
 int g_wws_read_probe = 0;
+
+/* DMA header stays video-backend-independent. Only the title runtime opts into
+ * this callback seam; standalone SPU/DMA users compile with it absent. */
+#ifdef PS3RECOMP_SPU_DMA_IMAGE17_CALLBACK
+#ifdef _WIN32
+static PVOID volatile s_spu_dma_image17_put_callback = NULL;
+
+void spu_dma_set_image17_put_callback(spu_dma_image17_put_callback callback)
+{
+    InterlockedExchangePointer(&s_spu_dma_image17_put_callback, (PVOID)callback);
+}
+
+spu_dma_image17_put_callback spu_dma_get_image17_put_callback(void)
+{
+    return (spu_dma_image17_put_callback)InterlockedCompareExchangePointer(
+        &s_spu_dma_image17_put_callback, NULL, NULL);
+}
+#else
+static _Atomic(spu_dma_image17_put_callback) s_spu_dma_image17_put_callback = NULL;
+
+void spu_dma_set_image17_put_callback(spu_dma_image17_put_callback callback)
+{
+    atomic_store_explicit(&s_spu_dma_image17_put_callback, callback, memory_order_release);
+}
+
+spu_dma_image17_put_callback spu_dma_get_image17_put_callback(void)
+{
+    return atomic_load_explicit(&s_spu_dma_image17_put_callback, memory_order_acquire);
+}
+#endif
+#endif
 
 /* The SPU decrementer ticks at the PS3 timebase, 79.8 MHz -- the same clock
  * sys_time_get_timebase_frequency reports to the PPU. Titles calibrate real
@@ -75,8 +109,9 @@ static SPU_TLS int     s_spu_halt_armed = 0;
  * the SPU thread group (e.g. cellSpursInitialize). lv2_register.c installs a
  * handler that maps spu_group_id -> connected event queue and pushes an event.
  * NULL until installed (plain SPU jobs with no PPU listener stay a no-op). */
-void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
-                            int is_intr, uint32_t value) = 0;
+int (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
+                           uint32_t spup, uint32_t command,
+                           uint32_t out_mbox_value) = 0;
 
 void spu_halt(spu_context* ctx)
 {
@@ -143,6 +178,16 @@ void spu_stop(spu_context* ctx)
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     int halted = 0;
+#if defined(TJ_DIAG_GEOMETRY_FAST_DRAIN)
+    if (ctx->image_id == 17) {
+        static int s_reported = 0;
+        if (!s_reported++) {
+            fprintf(stderr,
+                    "[TJ-DIAG] image17 transfer hooks bypassed; diagnostic only\n");
+            fflush(stderr);
+        }
+    }
+#endif
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
      * and stamp every image-1 run here to find the argless caller. */
@@ -181,30 +226,81 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 /* ===========================================================================
  * Per-context MFC engine registry
  * ===========================================================================*/
-#define SPU_MAX_CONTEXTS 8
+#define SPU_MAX_CONTEXTS        64
+#define SPU_MAX_CONTEXTS_SERIAL 8   /* the table size without job-chain lanes */
 
 typedef struct {
-    spu_context* ctx;
+    spu_context* volatile ctx;
     mfc_engine   mfc;
 } spu_mfc_slot;
 
 static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
 
+/* Slot limit: 64 with TJ_JOBCHAIN_LANES>=2 (lane helpers add live contexts),
+ * else the old 8 with the old shared fallback engine, so a lanes-off build
+ * assigns engines exactly as before. Read once; parsed like cellSpurs.c. */
+static int mfc_slot_limit(void)
+{
+    static volatile int s_limit = 0;
+    int limit = s_limit;
+    if (!limit) {
+        const char* text = getenv("TJ_JOBCHAIN_LANES");
+        long lanes = text && *text ? strtol(text, NULL, 0) : 1;
+        limit = lanes >= 2 ? SPU_MAX_CONTEXTS : SPU_MAX_CONTEXTS_SERIAL;
+        s_limit = limit;
+    }
+    return limit;
+}
+
+/* Several host threads look engines up at once (job-chain walkers and lane
+ * helpers, task sets, SPU threads). A free slot is claimed with one
+ * compare-exchange, so two new contexts never share an engine (with a single
+ * claimer this is the old first-free-slot assignment). Slots are never
+ * released, so the claimed slots stay a prefix and a context meets its own
+ * slot before any free one. A context runs on one host thread at a time, so
+ * the engine itself needs no lock. */
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    spu_mfc_slot* free_slot = NULL;
-    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
-        if (s_mfc_slots[i].ctx == ctx)
+    const int limit = mfc_slot_limit();
+    for (int i = 0; i < limit; i++) {
+        spu_context* owner = s_mfc_slots[i].ctx;
+        if (!owner) {
+#ifdef _WIN32
+            owner = (spu_context*)InterlockedCompareExchangePointer(
+                (PVOID volatile*)&s_mfc_slots[i].ctx, ctx, NULL);
+#else
+            owner = __sync_val_compare_and_swap(&s_mfc_slots[i].ctx,
+                                                (spu_context*)NULL, ctx);
+#endif
+            if (!owner) {
+                mfc_engine_init(&s_mfc_slots[i].mfc);
+                return &s_mfc_slots[i].mfc;
+            }
+        }
+        if (owner == ctx)
             return &s_mfc_slots[i].mfc;
-        if (!free_slot && s_mfc_slots[i].ctx == NULL)
-            free_slot = &s_mfc_slots[i];
     }
-    if (free_slot) {
-        free_slot->ctx = ctx;
-        mfc_engine_init(&free_slot->mfc);
-        return &free_slot->mfc;
+    /* Out of slots. Logged once: shows whether a run ever passes the table. */
+    {
+        static volatile long s_full_logged = 0;
+#ifdef _WIN32
+        if (!InterlockedExchange(&s_full_logged, 1))
+#else
+        if (!__sync_lock_test_and_set(&s_full_logged, 1))
+#endif
+            fprintf(stderr, "[spu-mfc] context table full (%d slots); %s fallback engine\n",
+                    limit, limit == SPU_MAX_CONTEXTS ? "per-thread" : "shared");
     }
-    /* Out of slots: fall back to a shared engine (correct for single-SPU). */
+    if (limit == SPU_MAX_CONTEXTS) {
+        /* Lanes: one engine per host thread. DMA completes synchronously and
+         * a thread runs one context at a time, so no other SPU can see its
+         * tag state mid-command (a process-wide shared engine could). */
+        static SPU_TLS mfc_engine fallback_tls;
+        static SPU_TLS int fallback_tls_init = 0;
+        if (!fallback_tls_init) { mfc_engine_init(&fallback_tls); fallback_tls_init = 1; }
+        return &fallback_tls;
+    }
+    /* Lanes off: the old shared engine (correct for single-SPU). */
     static mfc_engine fallback;
     static int fallback_init = 0;
     if (!fallback_init) { mfc_engine_init(&fallback); fallback_init = 1; }
@@ -221,25 +317,470 @@ static mfc_engine* mfc_for(spu_context* ctx)
  * traps). PUTLLC must FAIL when the line changed since GETLLAR. We implement the
  * compare-and-swap under one global lock across all SPU host threads.
  * ===========================================================================*/
-extern uint8_t* vm_base;
-
-/* Global spinlock guarding all atomic line ops. _InterlockedExchange is a
- * clang-cl/MSVC intrinsic (no runtime library symbol needed). */
-#include <intrin.h>
-static volatile long g_resv_lock = 0;
-static void resv_lock(void)   { while (_InterlockedExchange(&g_resv_lock, 1)) { } }
-static void resv_unlock(void) { _InterlockedExchange(&g_resv_lock, 0); }
-
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
  * the delta across one policy run to find the run that performed a claim. */
 volatile unsigned g_spu_putllc_count = 0;
 /* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the
  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
 volatile unsigned g_spu_putllc_sync_hit = 0;
+/* Armed by cellSpursEventFlagWait for the late Survival 0x0001 handshake. */
+volatile uint32_t g_spu_event_flag_watch_ea = 0;
+
+/* Targeted late-Survival diagnostic. SPU producer paths only perform atomic
+ * increments while a PPU waiter is active; they never emit a trace line. */
+#ifdef _WIN32
+static volatile LONG s_tj_late_eventflag_init;
+static volatile LONG s_tj_late_eventflag_active;
+static volatile LONG64 s_tj_late_image13_dispatch_begin;
+static volatile LONG64 s_tj_late_image13_dispatch_end;
+static volatile LONG64 s_tj_late_committed_atomics;
+static volatile LONG64 s_tj_late_jobchain_requests;
+static volatile LONG64 s_tj_late_jobchain_start_workers;
+static volatile LONG64 s_tj_late_jobchain_thread_created;
+static volatile LONG64 s_tj_late_jobchain_thread_create_failed;
+static volatile LONG64 s_tj_late_jobchain_worker_register_failed;
+static volatile LONG s_tj_late_last_image13_job;
+static volatile LONG s_tj_late_last_image13_pc;
+static volatile LONG s_tj_late_last_atomic_pc;
+static volatile LONG64 s_tj_late_transition_sequence;
+static volatile LONG s_tj_late_transition_lock;
+
+static void tj_late_eventflag_add(volatile LONG64* value) { InterlockedIncrement64(value); }
+static uint64_t tj_late_eventflag_load64(volatile LONG64* value) { return (uint64_t)InterlockedCompareExchange64(value, 0, 0); }
+static uint32_t tj_late_eventflag_load32(volatile LONG* value) { return (uint32_t)InterlockedCompareExchange(value, 0, 0); }
+static void tj_late_eventflag_store32(volatile LONG* value, uint32_t next) { InterlockedExchange(value, (LONG)next); }
+#else
+static volatile int s_tj_late_eventflag_init;
+static volatile int s_tj_late_eventflag_active;
+static volatile int64_t s_tj_late_image13_dispatch_begin;
+static volatile int64_t s_tj_late_image13_dispatch_end;
+static volatile int64_t s_tj_late_committed_atomics;
+static volatile int64_t s_tj_late_jobchain_requests;
+static volatile int64_t s_tj_late_jobchain_start_workers;
+static volatile int64_t s_tj_late_jobchain_thread_created;
+static volatile int64_t s_tj_late_jobchain_thread_create_failed;
+static volatile int64_t s_tj_late_jobchain_worker_register_failed;
+static volatile int s_tj_late_last_image13_job;
+static volatile int s_tj_late_last_image13_pc;
+static volatile int s_tj_late_last_atomic_pc;
+static volatile int64_t s_tj_late_transition_sequence;
+static volatile int s_tj_late_transition_lock;
+
+static void tj_late_eventflag_add(volatile int64_t* value) { __atomic_add_fetch(value, 1, __ATOMIC_RELAXED); }
+static uint64_t tj_late_eventflag_load64(volatile int64_t* value) { return (uint64_t)__atomic_load_n(value, __ATOMIC_ACQUIRE); }
+static uint32_t tj_late_eventflag_load32(volatile int* value) { return (uint32_t)__atomic_load_n(value, __ATOMIC_ACQUIRE); }
+static void tj_late_eventflag_store32(volatile int* value, uint32_t next) { __atomic_store_n(value, (int)next, __ATOMIC_RELEASE); }
+#endif
+
+static uint32_t s_tj_late_eventflag_ea;
+static TJLateEventFlagTransition
+    s_tj_late_transitions[TJ_LATE_EVENTFLAG_TRANSITION_CAPACITY];
+
+static uint64_t tj_late_eventflag_be64(const uint8_t* bytes)
+{
+    return ((uint64_t)bytes[0] << 56) | ((uint64_t)bytes[1] << 48) |
+           ((uint64_t)bytes[2] << 40) | ((uint64_t)bytes[3] << 32) |
+           ((uint64_t)bytes[4] << 24) | ((uint64_t)bytes[5] << 16) |
+           ((uint64_t)bytes[6] << 8) | (uint64_t)bytes[7];
+}
+
+static void tj_late_eventflag_transition_lock(void)
+{
+#ifdef _WIN32
+    while (InterlockedCompareExchange(&s_tj_late_transition_lock, 1, 0) != 0)
+        Sleep(0);
+#else
+    for (;;) {
+        int expected = 0;
+        if (__atomic_compare_exchange_n(&s_tj_late_transition_lock, &expected, 1, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            break;
+    }
+#endif
+}
+
+static void tj_late_eventflag_transition_unlock(void)
+{
+#ifdef _WIN32
+    InterlockedExchange(&s_tj_late_transition_lock, 0);
+#else
+    __atomic_store_n(&s_tj_late_transition_lock, 0, __ATOMIC_RELEASE);
+#endif
+}
+
+static uint64_t tj_late_eventflag_transition_next_sequence(void)
+{
+#ifdef _WIN32
+    return (uint64_t)InterlockedIncrement64(&s_tj_late_transition_sequence);
+#else
+    return (uint64_t)__atomic_add_fetch(&s_tj_late_transition_sequence, 1,
+                                        __ATOMIC_RELAXED);
+#endif
+}
+
+static uint64_t tj_late_eventflag_transition_current_sequence(void)
+{
+#ifdef _WIN32
+    return (uint64_t)InterlockedCompareExchange64(&s_tj_late_transition_sequence, 0, 0);
+#else
+    return (uint64_t)__atomic_load_n(&s_tj_late_transition_sequence,
+                                     __ATOMIC_ACQUIRE);
+#endif
+}
+
+static void tj_late_eventflag_transition_record(uint32_t eventflag_ea,
+                                                 uint8_t kind, uint8_t success,
+                                                 uint64_t memory, uint64_t reservation,
+                                                 uint64_t store, uint64_t line_version,
+                                                 uint64_t reservation_version,
+                                                 uint8_t reservation_valid,
+                                                 uint32_t image_id, uint32_t pc)
+{
+    /* Keep the small history live before the PPU waiter arms: the suspected
+     * race can consume the transition in that registration gap. */
+    if (!tj_late_eventflag_trace_matches(eventflag_ea)) return;
+
+    tj_late_eventflag_transition_lock();
+    uint64_t sequence = tj_late_eventflag_transition_next_sequence();
+    TJLateEventFlagTransition* record =
+        &s_tj_late_transitions[(sequence - 1u) % TJ_LATE_EVENTFLAG_TRANSITION_CAPACITY];
+    record->sequence = 0;
+    record->memory = memory;
+    record->reservation = reservation;
+    record->store = store;
+    record->line_version = line_version;
+    record->reservation_version = reservation_version;
+    record->image_id = image_id;
+    record->pc = pc;
+    record->kind = kind;
+    record->success = success;
+    record->reservation_valid = reservation_valid;
+    record->reserved = 0;
+    record->sequence = sequence;
+    tj_late_eventflag_transition_unlock();
+}
+
+static void tj_late_eventflag_configure(void)
+{
+#ifdef _WIN32
+    LONG state = InterlockedCompareExchange(&s_tj_late_eventflag_init, 1, 0);
+    if (state == 0) {
+#else
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&s_tj_late_eventflag_init, &expected, 1, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+#endif
+        const char* enabled = getenv("TJ_LATE_EVENTFLAG_TRACE");
+        const char* text = getenv("TJ_LATE_EVENTFLAG_EA");
+        char* end = NULL;
+        uint32_t ea = 0;
+        if (enabled && *enabled && text && *text) {
+            unsigned long parsed = strtoul(text, &end, 0);
+            if (end && *end == '\0' && parsed <= UINT32_MAX) ea = (uint32_t)parsed;
+        }
+        s_tj_late_eventflag_ea = ea ? (ea & ~127u) : 0;
+#ifdef _WIN32
+        InterlockedExchange(&s_tj_late_eventflag_init, 2);
+    } else {
+        while (InterlockedCompareExchange(&s_tj_late_eventflag_init, 0, 0) == 1) Sleep(0);
+#else
+        __atomic_store_n(&s_tj_late_eventflag_init, 2, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&s_tj_late_eventflag_init, __ATOMIC_ACQUIRE) != 2) {}
+#endif
+    }
+}
+
+int tj_late_eventflag_trace_matches(uint32_t eventflag_ea)
+{
+    tj_late_eventflag_configure();
+    return s_tj_late_eventflag_ea && (eventflag_ea & ~127u) == s_tj_late_eventflag_ea;
+}
+
+int tj_late_eventflag_trace_matches_jobchain(uint32_t jobchain_ea)
+{
+    tj_late_eventflag_configure();
+    return s_tj_late_eventflag_ea && jobchain_ea == s_tj_late_eventflag_ea + 0x80u;
+}
+
+int tj_late_eventflag_trace_arm(uint32_t eventflag_ea)
+{
+    if (!tj_late_eventflag_trace_matches(eventflag_ea)) return 0;
+#ifdef _WIN32
+    InterlockedIncrement(&s_tj_late_eventflag_active);
+#else
+    __atomic_add_fetch(&s_tj_late_eventflag_active, 1, __ATOMIC_ACQ_REL);
+#endif
+    return 1;
+}
+
+void tj_late_eventflag_trace_disarm(void)
+{
+#ifdef _WIN32
+    InterlockedDecrement(&s_tj_late_eventflag_active);
+#else
+    __atomic_sub_fetch(&s_tj_late_eventflag_active, 1, __ATOMIC_ACQ_REL);
+#endif
+}
+
+int tj_late_eventflag_trace_is_active(void)
+{
+#ifdef _WIN32
+    return InterlockedCompareExchange(&s_tj_late_eventflag_active, 0, 0) != 0;
+#else
+    return __atomic_load_n(&s_tj_late_eventflag_active, __ATOMIC_ACQUIRE) != 0;
+#endif
+}
+
+void tj_late_eventflag_trace_snapshot(TJLateEventFlagCounters* out)
+{
+    if (!out) return;
+    out->image13_dispatch_begin = tj_late_eventflag_load64(&s_tj_late_image13_dispatch_begin);
+    out->image13_dispatch_end = tj_late_eventflag_load64(&s_tj_late_image13_dispatch_end);
+    out->committed_atomics = tj_late_eventflag_load64(&s_tj_late_committed_atomics);
+    out->jobchain_requests = tj_late_eventflag_load64(&s_tj_late_jobchain_requests);
+    out->jobchain_start_workers = tj_late_eventflag_load64(&s_tj_late_jobchain_start_workers);
+    out->jobchain_thread_created = tj_late_eventflag_load64(&s_tj_late_jobchain_thread_created);
+    out->jobchain_thread_create_failed = tj_late_eventflag_load64(&s_tj_late_jobchain_thread_create_failed);
+    out->jobchain_worker_register_failed = tj_late_eventflag_load64(&s_tj_late_jobchain_worker_register_failed);
+    out->last_image13_job = tj_late_eventflag_load32(&s_tj_late_last_image13_job);
+    out->last_image13_pc = tj_late_eventflag_load32(&s_tj_late_last_image13_pc);
+    out->last_atomic_pc = tj_late_eventflag_load32(&s_tj_late_last_atomic_pc);
+}
+
+uint32_t tj_late_eventflag_trace_transition_snapshot(
+    TJLateEventFlagTransition out[TJ_LATE_EVENTFLAG_TRANSITION_CAPACITY])
+{
+    if (!out) return 0;
+
+    tj_late_eventflag_transition_lock();
+    uint64_t last = tj_late_eventflag_transition_current_sequence();
+    uint32_t count = (uint32_t)(last < TJ_LATE_EVENTFLAG_TRANSITION_CAPACITY
+                                    ? last : TJ_LATE_EVENTFLAG_TRANSITION_CAPACITY);
+    uint64_t first = last - count + 1u;
+    for (uint32_t i = 0; i < count; i++)
+        out[i] = s_tj_late_transitions[(first + i - 1u) %
+                                       TJ_LATE_EVENTFLAG_TRANSITION_CAPACITY];
+    tj_late_eventflag_transition_unlock();
+    return count;
+}
+
+void tj_late_eventflag_trace_note_ppu_registration(uint32_t eventflag_ea,
+                                                    uint64_t before, uint64_t after)
+{
+    tj_late_eventflag_transition_record(
+        eventflag_ea, TJ_LATE_EVENTFLAG_TRANSITION_PPU_REGISTER, 1,
+        before, 0, after, 0, 0, 0, 0, 0);
+}
+
+void tj_late_eventflag_trace_note_ppu_pending_clear(uint32_t eventflag_ea,
+                                                     uint64_t before, uint64_t after)
+{
+    tj_late_eventflag_transition_record(
+        eventflag_ea, TJ_LATE_EVENTFLAG_TRANSITION_PPU_PENDING_CLEAR, 1,
+        before, 0, after, 0, 0, 0, 0, 0);
+}
+
+void tj_late_eventflag_trace_note_getllar(uint32_t eventflag_ea,
+                                           uint64_t memory, uint64_t line_version,
+                                           int reservation_valid, uint32_t image_id,
+                                           uint32_t pc)
+{
+    tj_late_eventflag_transition_record(
+        eventflag_ea, TJ_LATE_EVENTFLAG_TRANSITION_GETLLAR, 1,
+        memory, memory, 0, line_version, line_version,
+        reservation_valid ? 1u : 0u, image_id, pc);
+}
+
+void tj_late_eventflag_trace_note_putllc(uint32_t eventflag_ea, int success,
+                                          uint64_t memory, uint64_t reservation,
+                                          uint64_t store, uint64_t line_version,
+                                          uint64_t reservation_version,
+                                          int reservation_valid, uint32_t image_id,
+                                          uint32_t pc)
+{
+    tj_late_eventflag_transition_record(
+        eventflag_ea,
+        success ? TJ_LATE_EVENTFLAG_TRANSITION_PUTLLC_SUCCESS
+                : TJ_LATE_EVENTFLAG_TRANSITION_PUTLLC_FAIL,
+        success ? 1u : 0u, memory, reservation, store, line_version,
+        reservation_version, reservation_valid ? 1u : 0u, image_id, pc);
+}
+
+void tj_late_eventflag_trace_note_image13_dispatch(uint32_t job_ea, uint32_t pc, int began)
+{
+    if (!tj_late_eventflag_trace_is_active()) return;
+    if (began) tj_late_eventflag_add(&s_tj_late_image13_dispatch_begin);
+    else tj_late_eventflag_add(&s_tj_late_image13_dispatch_end);
+    tj_late_eventflag_store32(&s_tj_late_last_image13_job, job_ea);
+    tj_late_eventflag_store32(&s_tj_late_last_image13_pc, pc);
+}
+
+void tj_late_eventflag_trace_note_committed_atomic(uint32_t eventflag_ea, uint32_t pc)
+{
+    if (!tj_late_eventflag_trace_is_active() || !tj_late_eventflag_trace_matches(eventflag_ea)) return;
+    tj_late_eventflag_add(&s_tj_late_committed_atomics);
+    tj_late_eventflag_store32(&s_tj_late_last_atomic_pc, pc);
+}
+
+void tj_late_eventflag_trace_note_jobchain_request(uint32_t jobchain_ea, int start_worker)
+{
+    if (!tj_late_eventflag_trace_is_active() ||
+        !tj_late_eventflag_trace_matches_jobchain(jobchain_ea)) return;
+    tj_late_eventflag_add(&s_tj_late_jobchain_requests);
+    if (start_worker) tj_late_eventflag_add(&s_tj_late_jobchain_start_workers);
+}
+
+void tj_late_eventflag_trace_note_jobchain_thread_result(uint32_t jobchain_ea, int created)
+{
+    if (!tj_late_eventflag_trace_is_active() ||
+        !tj_late_eventflag_trace_matches_jobchain(jobchain_ea)) return;
+    if (created) tj_late_eventflag_add(&s_tj_late_jobchain_thread_created);
+    else tj_late_eventflag_add(&s_tj_late_jobchain_thread_create_failed);
+}
+
+void tj_late_eventflag_trace_note_jobchain_worker_register_failure(uint32_t jobchain_ea)
+{
+    if (tj_late_eventflag_trace_is_active() &&
+        tj_late_eventflag_trace_matches_jobchain(jobchain_ea))
+        tj_late_eventflag_add(&s_tj_late_jobchain_worker_register_failed);
+}
+
+static void trace_watched_event_flag_atomic(const spu_context* ctx,
+                                            const char* command,
+                                            uint32_t ea,
+                                            const uint8_t* before,
+                                            const uint8_t* after)
+{
+    if (!g_spu_event_flag_watch_ea ||
+        (ea & ~127u) != (g_spu_event_flag_watch_ea & ~127u) ||
+        memcmp(before, after, 8) == 0)
+        return;
+
+    static unsigned count = 0;
+    if (count++ >= 64) return;
+    fprintf(stderr,
+            "[eventflag-atomic] %s img=%d pc=0x%05X ea=0x%08X "
+            "before=%02X%02X%02X%02X%02X%02X%02X%02X "
+            "after=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+            command, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK, ea,
+            before[0], before[1], before[2], before[3],
+            before[4], before[5], before[6], before[7],
+            after[0], after[1], after[2], after[3],
+            after[4], after[5], after[6], after[7]);
+    fflush(stderr);
+}
+
+enum { TJ_COMPLETION_ATOM_HISTORY_CAPACITY = 128 };
+
+typedef struct TJCompletionAtomHistoryEntry {
+    uint64_t sequence;
+    uint64_t timestamp_ms;
+    uint32_t line_ea;
+    uint32_t pc;
+    int32_t image_id;
+    uint8_t success;
+    uint8_t before[MFC_ATOMIC_LINE];
+    uint8_t store[MFC_ATOMIC_LINE];
+    uint8_t after[MFC_ATOMIC_LINE];
+} TJCompletionAtomHistoryEntry;
+
+static TJCompletionAtomHistoryEntry
+    s_tj_completion_atom_history[TJ_COMPLETION_ATOM_HISTORY_CAPACITY];
+static uint64_t s_tj_completion_atom_sequence;
+
+/* Called with the reservation lock held after PUTLLC verdict/commit. */
+static void tj_completion_atom_history_record_locked(
+    const spu_context* ctx, uint32_t line_ea, int success,
+    const uint8_t before[MFC_ATOMIC_LINE],
+    const uint8_t store[MFC_ATOMIC_LINE],
+    const uint8_t after[MFC_ATOMIC_LINE])
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("TJ_SPU_COMPLETION_WAIT_TRACE") ? 1 : 0;
+    if (!enabled || !ctx || ctx->image_id != 15) return;
+
+    extern unsigned long long ps3_ms_now(void);
+    uint64_t sequence = ++s_tj_completion_atom_sequence;
+    TJCompletionAtomHistoryEntry* entry =
+        &s_tj_completion_atom_history[
+            (sequence - 1u) % TJ_COMPLETION_ATOM_HISTORY_CAPACITY];
+    entry->sequence = 0;
+    entry->timestamp_ms = ps3_ms_now();
+    entry->line_ea = line_ea;
+    entry->pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+    entry->image_id = ctx->image_id;
+    entry->success = success ? 1u : 0u;
+    memcpy(entry->before, before, MFC_ATOMIC_LINE);
+    memcpy(entry->store, store, MFC_ATOMIC_LINE);
+    memcpy(entry->after, after, MFC_ATOMIC_LINE);
+    entry->sequence = sequence;
+}
+
+static uint32_t tj_completion_atom_read_be32(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+void spu_completion_atomic_history_snapshot(FILE* out, uint32_t completion_ea)
+{
+    TJCompletionAtomHistoryEntry snapshot[TJ_COMPLETION_ATOM_HISTORY_CAPACITY];
+    uint64_t last_sequence;
+    uint32_t line_ea = completion_ea & ~(MFC_ATOMIC_LINE - 1u);
+    uint32_t offset = completion_ea - line_ea;
+    if (!out) out = stderr;
+
+    spu_reservation_lock();
+    memcpy(snapshot, s_tj_completion_atom_history, sizeof(snapshot));
+    last_sequence = s_tj_completion_atom_sequence;
+    spu_reservation_unlock();
+
+    extern unsigned long long ps3_ms_now(void);
+    uint64_t now_ms = ps3_ms_now();
+    uint64_t first_sequence = last_sequence > TJ_COMPLETION_ATOM_HISTORY_CAPACITY
+        ? last_sequence - TJ_COMPLETION_ATOM_HISTORY_CAPACITY + 1u : 1u;
+    unsigned matched = 0;
+    fprintf(out,
+            "[TJ-SPU-COMPLETION-ATOM] target=0x%08X line=0x%08X "
+            "offset=0x%02X retained=%llu\n",
+            completion_ea, line_ea, offset,
+            (unsigned long long)(last_sequence >= first_sequence
+                ? last_sequence - first_sequence + 1u : 0u));
+    if (offset <= MFC_ATOMIC_LINE - 4u) {
+        for (uint64_t sequence = first_sequence;
+             sequence <= last_sequence; ++sequence) {
+            const TJCompletionAtomHistoryEntry* entry =
+                &snapshot[(sequence - 1u) % TJ_COMPLETION_ATOM_HISTORY_CAPACITY];
+            if (entry->sequence != sequence || entry->line_ea != line_ea)
+                continue;
+            fprintf(out,
+                    "[TJ-SPU-COMPLETION-ATOM] seq=%llu age_ms=%llu image=%d "
+                    "pc=0x%05X result=%s before=0x%08X store=0x%08X "
+                    "after=0x%08X\n",
+                    (unsigned long long)entry->sequence,
+                    (unsigned long long)(now_ms >= entry->timestamp_ms
+                        ? now_ms - entry->timestamp_ms : 0u),
+                    entry->image_id, entry->pc,
+                    entry->success ? "SUCCESS" : "FAIL",
+                    tj_completion_atom_read_be32(entry->before + offset),
+                    tj_completion_atom_read_be32(entry->store + offset),
+                    tj_completion_atom_read_be32(entry->after + offset));
+            matched++;
+        }
+    }
+    fprintf(out, "[TJ-SPU-COMPLETION-ATOM] matched=%u\n", matched);
+    fflush(out);
+}
 
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
+    if (cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD &&
+        cmd != MFC_PUTLLUC_CMD && cmd != MFC_PUTQLLUC_CMD)
+        return 0;
+
     uint32_t ea  = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
     uint8_t* ls  = &ctx->ls[lsa];
@@ -252,9 +793,15 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             fprintf(stderr, "[atomcnt] %llu atomic ops; last cmd=0x%X ea=0x%08X\n",
                     (unsigned long long)s_n, cmd, ea);
           s_lastea = ea; } } }
-    { static int s_at = -1; if (s_at < 0) s_at = getenv("YDKJ_ATOMTRACE") ? 1 : 0;
-      if (s_at) { static int _a=0; if (_a++ < 40)
-        fprintf(stderr, "[atom] cmd=0x%02X ea=0x%08X (img=%d)\n", cmd, ea, ctx->image_id); } }
+    { static int s_at = -1; static int s_at_img = -2;
+      if (s_at < 0) s_at = getenv("YDKJ_ATOMTRACE") ? 1 : 0;
+      if (s_at_img == -2) { const char* e = getenv("YDKJ_ATOM_IMG");
+        s_at_img = e ? atoi(e) : -1; }
+      if (s_at && (s_at_img < 0 || ctx->image_id == s_at_img)) {
+        static int _a=0; if (_a++ < 120)
+          fprintf(stderr, "[atom] cmd=0x%02X ea=0x%08X raw=0x%08X lsa=0x%05X "
+                  "pc=0x%05X img=%d\n", cmd, ea, ctx->mfc_eal, lsa,
+                  (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id); } }
     /* cri task (img22) atomic on the taskset: dump the loaded bitset line so we can
      * see if the task reads MY taskset (0x4005E000) with my READY bit, or elsewhere. */
     { static int s_ct=-1; if(s_ct<0) s_ct=getenv("YDKJ_ATOMTRACE")?1:0;
@@ -289,12 +836,22 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     if (!mfc_ea_range_committed(ea, MFC_ATOMIC_LINE)) {
         static int s_w = 0;
         if (s_w++ < 16)
-            fprintf(stderr, "[spu-atomic] cmd=0x%X ea=0x%08X uncommitted -- skipped\n", cmd, ea);
+            fprintf(stderr, "[spu-atomic] cmd=0x%X ea=0x%08X raw=0x%08X lsa=0x%05X pc=0x%05X uncommitted -- skipped\n",
+                    cmd, ea, ctx->mfc_eal, lsa, ctx->pc);
         if (cmd == MFC_GETLLAR_CMD) {
             memset(ls, 0, MFC_ATOMIC_LINE);
             ctx->resv_ea = ea; ctx->resv_valid = 0; ctx->atomic_stat = 0;
+            tj_late_eventflag_trace_note_getllar(
+                ea, 0, 0, 0, (uint32_t)ctx->image_id,
+                (uint32_t)ctx->pc & SPU_LS_MASK);
         } else {
             ctx->atomic_stat = 1;   /* PUTLLC failure (line "moved") */
+            if (cmd == MFC_PUTLLC_CMD)
+                tj_late_eventflag_trace_note_putllc(
+                    ea, 0, 0, tj_late_eventflag_be64(ctx->resv_line),
+                    tj_late_eventflag_be64(ls), 0, ctx->resv_version,
+                    ctx->resv_valid, (uint32_t)ctx->image_id,
+                    (uint32_t)ctx->pc & SPU_LS_MASK);
         }
         return 1;
     }
@@ -308,18 +865,60 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             g_barrier_sync_watch = s_aea; } /* arm PUTLLC OK/FAIL verdict log */ }
       if (s_ae == 1 && ((uint32_t)ea & ~127u) == s_aea) {
           static int _n = 0;
-          if (_n++ < 48) {
+          static int _limit = -1;
+          if (_limit < 0) {
+              const char* e = getenv("SPU_ATOM_LIMIT");
+              _limit = e ? atoi(e) : 48;
+              if (_limit < 1) _limit = 1;
+          }
+          if (_n++ < _limit) {
               extern uint8_t* vm_base;
               const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
-              fprintf(stderr, "[atom-ea] cmd=0x%X img=%d pc=0x%05X ea=0x%08X "
-                      "RAM=%02X%02X%02X%02X %02X%02X%02X%02X",
-                      cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK, (uint32_t)ea,
-                      r[0],r[1],r[2],r[3], r[4],r[5],r[6],r[7]);
+              uint32_t tid = ((uint32_t)ctx->ls[0x27D4] << 24) |
+                             ((uint32_t)ctx->ls[0x27D5] << 16) |
+                             ((uint32_t)ctx->ls[0x27D6] << 8)  |
+                              (uint32_t)ctx->ls[0x27D7];
+              uint32_t sn = ((uint32_t)ctx->ls[0x1C8] << 24) |
+                            ((uint32_t)ctx->ls[0x1C9] << 16) |
+                            ((uint32_t)ctx->ls[0x1CA] << 8)  |
+                             (uint32_t)ctx->ls[0x1CB];
+              fprintf(stderr, "[atom-ea] cmd=0x%X img=%d pc=0x%05X ea=0x%08X task=%u spu=%u\n",
+                      cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      (uint32_t)ea, tid, sn);
               if (cmd == MFC_PUTLLC_CMD) {
-                  fprintf(stderr, " STORE=%02X%02X%02X%02X %02X%02X%02X%02X",
-                          ls[0],ls[1],ls[2],ls[3], ls[4],ls[5],ls[6],ls[7]);
+                  for (uint32_t off = 0; off < MFC_ATOMIC_LINE; off += 16) {
+                      if (memcmp(r + off, ls + off, 16) != 0) {
+                          fprintf(stderr,
+                                  "[atom-diff] +%02X RAM="
+                                  "%02X%02X%02X%02X %02X%02X%02X%02X "
+                                  "%02X%02X%02X%02X %02X%02X%02X%02X STORE="
+                                  "%02X%02X%02X%02X %02X%02X%02X%02X "
+                                  "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                                  off,
+                                  r[off+0],r[off+1],r[off+2],r[off+3],
+                                  r[off+4],r[off+5],r[off+6],r[off+7],
+                                  r[off+8],r[off+9],r[off+10],r[off+11],
+                                  r[off+12],r[off+13],r[off+14],r[off+15],
+                                  ls[off+0],ls[off+1],ls[off+2],ls[off+3],
+                                  ls[off+4],ls[off+5],ls[off+6],ls[off+7],
+                                  ls[off+8],ls[off+9],ls[off+10],ls[off+11],
+                                  ls[off+12],ls[off+13],ls[off+14],ls[off+15]);
+                      }
+                  }
+              } else {
+                  for (uint32_t off = 0; off < MFC_ATOMIC_LINE; off += 16) {
+                      fprintf(stderr,
+                              "[atom-row] +%02X="
+                              "%02X%02X%02X%02X %02X%02X%02X%02X "
+                              "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                              off,
+                              r[off+0],r[off+1],r[off+2],r[off+3],
+                              r[off+4],r[off+5],r[off+6],r[off+7],
+                              r[off+8],r[off+9],r[off+10],r[off+11],
+                              r[off+12],r[off+13],r[off+14],r[off+15]);
+                  }
               }
-              fprintf(stderr, "\n"); fflush(stderr);
+              fflush(stderr);
           }
       } }
     /* Bink sync-line atomic trace (armed by the PPU-side producer probe). */
@@ -341,11 +940,20 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
-        resv_lock();
+        spu_reservation_lock();
+        uint64_t get_version = 0;
+        int get_slot = spu_reservation_version_locked(ea, &get_version);
         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
         memcpy(ctx->resv_line, mem, MFC_ATOMIC_LINE);  /* snapshot for compare */
-        ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
-        resv_unlock();
+        ctx->resv_ea = ea;
+        ctx->resv_valid = get_slot;
+        ctx->resv_version = get_slot ? get_version : 0;
+        ctx->atomic_stat = 0;
+        spu_reservation_unlock();
+        tj_late_eventflag_trace_note_getllar(
+            ea, tj_late_eventflag_be64(ctx->resv_line), ctx->resv_version,
+            ctx->resv_valid, (uint32_t)ctx->image_id,
+            (uint32_t)ctx->pc & SPU_LS_MASK);
         return 1;
 
     case MFC_PUTLLC_CMD:
@@ -353,11 +961,35 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
-        resv_lock();
+        spu_taskset_putllc_begin();
+        uint64_t put_version = 0;
+        int put_slot = spu_reservation_version_locked(ea, &put_version);
+        uint16_t verdict_mem_events = (uint16_t)(((uint16_t)mem[0] << 8) | mem[1]);
+        uint16_t verdict_mem_mask = (uint16_t)(((uint16_t)mem[4] << 8) | mem[5]);
+        uint8_t verdict_mem_pending = mem[7];
+        uint16_t verdict_store_events = (uint16_t)(((uint16_t)ls[0] << 8) | ls[1]);
+        uint16_t verdict_store_mask = (uint16_t)(((uint16_t)ls[4] << 8) | ls[5]);
+        uint8_t verdict_store_pending = ls[7];
+        uint16_t verdict_resv_events = (uint16_t)(((uint16_t)ctx->resv_line[0] << 8) |
+                                                   ctx->resv_line[1]);
+        uint16_t verdict_resv_mask = (uint16_t)(((uint16_t)ctx->resv_line[4] << 8) |
+                                                 ctx->resv_line[5]);
+        uint8_t verdict_resv_pending = ctx->resv_line[7];
+        uint64_t verdict_line_version = put_slot ? put_version : 0;
+        uint64_t verdict_ctx_version = ctx->resv_version;
+        uint64_t verdict_mem_control = tj_late_eventflag_be64(mem);
+        uint64_t verdict_resv_control = tj_late_eventflag_be64(ctx->resv_line);
+        uint64_t verdict_store_control = tj_late_eventflag_be64(ls);
         if (ctx->resv_valid && ctx->resv_ea == ea &&
+            put_slot && ctx->resv_version == put_version &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            spu_reservation_bump_locked(ea);
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
+            trace_watched_event_flag_atomic(ctx, "PUTLLC", ea,
+                                            ctx->resv_line, ls);
+            tj_late_eventflag_trace_note_committed_atomic(
+                ea, (uint32_t)ctx->pc & SPU_LS_MASK);
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
         }
@@ -376,16 +1008,54 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                           (r[10]<<8)|r[11],(r[12]<<8)|r[13],(r[14]<<8)|r[15]);
               }
           } }
+        { static int s_vtrace = -1; static uint32_t s_vtrace_ea = 0;
+          if (s_vtrace < 0) {
+              const char* e = getenv("SPU_ATOM_VERDICT_EA");
+              s_vtrace_ea = e ? ((uint32_t)strtoul(e, NULL, 16) & ~127u) : 0;
+              s_vtrace = s_vtrace_ea ? 1 : 0;
+          }
+          if (s_vtrace && ea == s_vtrace_ea &&
+              ((verdict_mem_mask | verdict_store_mask | verdict_resv_mask) & 0x0200u)) {
+              fprintf(stderr,
+                      "[atom-verdict] img=%d pc=0x%05X "
+                      "mem={events=%04X mask=%04X pending=%02X} "
+                      "resv={events=%04X mask=%04X pending=%02X} "
+                      "store={events=%04X mask=%04X pending=%02X} "
+                      "ver=%llu/%llu valid=%d result=%s\n",
+                      ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      verdict_mem_events, verdict_mem_mask, verdict_mem_pending,
+                      verdict_resv_events, verdict_resv_mask, verdict_resv_pending,
+                      verdict_store_events, verdict_store_mask, verdict_store_pending,
+                      (unsigned long long)verdict_ctx_version,
+                      (unsigned long long)verdict_line_version,
+                      ctx->resv_valid,
+                      ctx->atomic_stat == 0 ? "SUCCESS" : "FAIL");
+              fflush(stderr);
+          }
+        }
+        int putllc_success = ctx->atomic_stat == 0;
+        tj_completion_atom_history_record_locked(
+            ctx, ea, putllc_success, ctx->resv_line, ls, mem);
+        tj_late_eventflag_trace_note_putllc(
+            ea, putllc_success, verdict_mem_control, verdict_resv_control,
+            verdict_store_control, verdict_line_version, verdict_ctx_version,
+            ctx->resv_valid, (uint32_t)ctx->image_id,
+            (uint32_t)ctx->pc & SPU_LS_MASK);
         ctx->resv_valid = 0;                           /* reservation consumed */
-        resv_unlock();
+        spu_taskset_putllc_end(ea, ctx->resv_line, ls, putllc_success);
         return 1;
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
-        resv_lock();
+        spu_reservation_lock();
+        uint8_t unconditional_before[8];
+        memcpy(unconditional_before, mem, sizeof(unconditional_before));
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        spu_reservation_bump_locked(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 0;
-        resv_unlock();
+        trace_watched_event_flag_atomic(ctx, "PUTLLUC", ea,
+                                        unconditional_before, ls);
+        spu_reservation_unlock();
         return 1;
 
     default:
@@ -441,14 +1111,114 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         { static int s_t = -1; if (s_t < 0) s_t = getenv("YDKJ_MBOXTRACE") ? 1 : 0;
           if (s_t) fprintf(stderr, "[spu-mbox] OUT  grp=0x%X spu=0x%X val=0x%08X\n",
                            ctx->spu_group_id, ctx->spu_id, v); }
-        if (g_spu_out_mbox_hook) g_spu_out_mbox_hook(ctx->spu_group_id, ctx->spu_id, 0, v);
         break;
     case SPU_WrOutIntrMbox:
         spu_channel_write(&ctx->ch_out_intr_mbox, v);
         { static int s_t = -1; if (s_t < 0) s_t = getenv("YDKJ_MBOXTRACE") ? 1 : 0;
           if (s_t) fprintf(stderr, "[spu-mbox] INTR grp=0x%X spu=0x%X val=0x%08X\n",
                            ctx->spu_group_id, ctx->spu_id, v); }
-        if (g_spu_out_mbox_hook) g_spu_out_mbox_hook(ctx->spu_group_id, ctx->spu_id, 1, v);
+        {
+            uint32_t code = v >> 24;
+            uint32_t port = code & 0x3Fu;
+            uint32_t data0 = v & 0x00FFFFFFu;
+            uint32_t data1;
+            uint32_t response_slot = 0;
+            int rc = CELL_OK;
+
+            /* High-byte 0..63 is sys_spu_thread_send_event.  Other classes
+             * are distinct SPU kernel operations; never alias them to a user
+             * port by masking the class away. */
+            if (code >= 64) {
+                /* 64..127 is sys_spu_thread_throw_event: same event tuple,
+                 * but no inbound-mailbox result.  Keep the preceding OutMbox
+                 * word across queue-full retries. */
+                if (code >= 128 || !spu_channel_has_data(&ctx->ch_out_mbox))
+                    break;
+                data1 = spu_channel_read(&ctx->ch_out_mbox);
+                if (ctx->spu_group_id) {
+                    extern int cellSpursDeliverSpuEvent(uint32_t, uint32_t, uint32_t, uint32_t);
+                    while ((rc = cellSpursDeliverSpuEvent(ctx->spu_group_id,
+                                                           port, data0, data1)) == -2) {
+#ifdef _WIN32
+                        Sleep(1);
+#else
+                        struct timespec retry = { 0, 1000000 }; nanosleep(&retry, NULL);
+#endif
+                    }
+                    if (rc == 1)
+                        break;
+                }
+                if (g_spu_out_mbox_hook) {
+                    while (g_spu_out_mbox_hook(ctx->spu_group_id, ctx->spu_id,
+                                                port, data0, data1) == -2) {
+#ifdef _WIN32
+                        Sleep(1);
+#else
+                        struct timespec retry = { 0, 1000000 }; nanosleep(&retry, NULL);
+#endif
+                    }
+                }
+                break;
+            }
+
+            if (!spu_channel_has_data(&ctx->ch_out_mbox)) {
+                /* RPCS3 treats this as an invalid send_event operation.  Give
+                 * the SPU a response instead of letting its following RdInMbox
+                 * block forever. */
+                if (ctx->in_mbox_owner)
+                    spu_in_mbox_set_response(ctx->in_mbox_owner, CELL_EINVAL);
+                else
+                    spu_channel_write(&ctx->ch_in_mbox, CELL_EINVAL);
+                break;
+            }
+            data1 = spu_channel_read(&ctx->ch_out_mbox);
+
+            /* PS3 send_event requires an empty inbound mailbox.  Match LV2:
+             * consume OutMbox, return a single CELL_EBUSY without sending when
+             * PPU data is already pending; otherwise reserve CELL_OK in place
+             * before queue delivery.  Never wait here: this SPU is the only
+             * consumer that could make mailbox space. */
+            if (ctx->in_mbox_owner &&
+                !spu_in_mbox_reserve_response(ctx->in_mbox_owner, &response_slot))
+                break;
+
+            if (ctx->spu_group_id) {
+                extern int cellSpursDeliverSpuEvent(uint32_t, uint32_t, uint32_t, uint32_t);
+                while ((rc = cellSpursDeliverSpuEvent(ctx->spu_group_id,
+                                                       port, data0, data1)) == -2) {
+#ifdef _WIN32
+                    Sleep(1);
+#else
+                    struct timespec retry = { 0, 1000000 }; nanosleep(&retry, NULL);
+#endif
+                }
+                if (rc == 1) {
+                    if (ctx->in_mbox_owner)
+                        spu_in_mbox_update_response(ctx->in_mbox_owner, response_slot, CELL_OK);
+                    else
+                        spu_channel_write(&ctx->ch_in_mbox, CELL_OK);
+                    break;
+                }
+            }
+            if (g_spu_out_mbox_hook) {
+                /* Queue-full is backpressure, not a dropped completion.  The
+                 * consumed OutMbox word stays in data1 across retries. */
+                while ((rc = g_spu_out_mbox_hook(ctx->spu_group_id, ctx->spu_id,
+                                                  port, data0, data1)) == -2) {
+#ifdef _WIN32
+                    Sleep(1);
+#else
+                    struct timespec retry = { 0, 1000000 }; nanosleep(&retry, NULL);
+#endif
+                }
+            } else {
+                rc = (int)CELL_ENOTCONN;
+            }
+            if (ctx->in_mbox_owner)
+                spu_in_mbox_update_response(ctx->in_mbox_owner, response_slot, (uint32_t)rc);
+            else
+                spu_channel_write(&ctx->ch_in_mbox, (uint32_t)rc);
+        }
         break;
     case SPU_WrDec:          ctx->decrementer = v;
                              ctx->dec_base_ns = spu_host_ns();              break;
@@ -487,7 +1257,9 @@ static int yz_ch_block(void)
 static int spu_ch_ready(spu_context* ctx, uint32_t channel)
 {
     switch (channel) {
-    case SPU_RdInMbox:      return ctx->ch_in_mbox.count != 0;
+    case SPU_RdInMbox:      return ctx->in_mbox_owner
+                                  ? spu_in_mbox_count(ctx->in_mbox_owner) != 0
+                                  : ctx->ch_in_mbox.count != 0;
     case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count != 0;
     case SPU_RdSigNotify2:  return ctx->ch_sig_notify[1].count != 0;
     case SPU_RdEventStat:   return (ctx->event_status & ctx->event_mask) != 0;
@@ -501,6 +1273,237 @@ void spu_ch_wake(spu_context* ctx)
 {
     if (!ctx) return;
     WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
+}
+
+void spu_in_mbox_init(spu_inbound_mailbox* mbox)
+{
+    if (!mbox) return;
+    memset(mbox, 0, sizeof(*mbox));
+#ifndef _WIN32
+    pthread_mutex_init(&mbox->lock, NULL);
+    pthread_cond_init(&mbox->not_empty, NULL);
+    pthread_cond_init(&mbox->not_full, NULL);
+#endif
+}
+
+void spu_in_mbox_destroy(spu_inbound_mailbox* mbox)
+{
+    if (!mbox) return;
+#ifndef _WIN32
+    pthread_cond_destroy(&mbox->not_full);
+    pthread_cond_destroy(&mbox->not_empty);
+    pthread_mutex_destroy(&mbox->lock);
+#else
+    (void)mbox; /* SRWLOCK/CONDITION_VARIABLE require no destruction. */
+#endif
+}
+
+void spu_in_mbox_write(spu_inbound_mailbox* mbox, uint32_t value)
+{
+    if (!mbox) return;
+#ifdef _WIN32
+    AcquireSRWLockExclusive((SRWLOCK*)&mbox->lock);
+    while (mbox->count == SPU_IN_MBOX_DEPTH)
+        SleepConditionVariableSRW((CONDITION_VARIABLE*)&mbox->not_full,
+                                  (SRWLOCK*)&mbox->lock, INFINITE, 0);
+    mbox->words[mbox->tail] = value;
+    mbox->tail = (mbox->tail + 1) % SPU_IN_MBOX_DEPTH;
+    mbox->count++;
+    WakeConditionVariable((CONDITION_VARIABLE*)&mbox->not_empty);
+    ReleaseSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_lock(&mbox->lock);
+    while (mbox->count == SPU_IN_MBOX_DEPTH)
+        pthread_cond_wait(&mbox->not_full, &mbox->lock);
+    mbox->words[mbox->tail] = value;
+    mbox->tail = (mbox->tail + 1) % SPU_IN_MBOX_DEPTH;
+    mbox->count++;
+    pthread_cond_signal(&mbox->not_empty);
+    pthread_mutex_unlock(&mbox->lock);
+#endif
+}
+
+int spu_in_mbox_try_write(spu_inbound_mailbox* mbox, uint32_t value)
+{
+    int written = 0;
+    if (!mbox) return 0;
+#ifdef _WIN32
+    AcquireSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_lock(&mbox->lock);
+#endif
+    if (mbox->count < SPU_IN_MBOX_DEPTH) {
+        mbox->words[mbox->tail] = value;
+        mbox->tail = (mbox->tail + 1) % SPU_IN_MBOX_DEPTH;
+        mbox->count++;
+        written = 1;
+#ifdef _WIN32
+        WakeConditionVariable((CONDITION_VARIABLE*)&mbox->not_empty);
+#else
+        pthread_cond_signal(&mbox->not_empty);
+#endif
+    }
+#ifdef _WIN32
+    ReleaseSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_unlock(&mbox->lock);
+#endif
+    return written;
+}
+
+int spu_in_mbox_reserve_response(spu_inbound_mailbox* mbox, uint32_t* slot)
+{
+    int reserved = 0;
+    if (!mbox || !slot) return 0;
+#ifdef _WIN32
+    AcquireSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_lock(&mbox->lock);
+#endif
+    if (mbox->count) {
+        /* Exact sys_spu_thread_send_event busy contract: pending inbound data
+         * is replaced by the one-word CELL_EBUSY response. */
+        mbox->head = 0;
+        mbox->tail = 1;
+        mbox->count = 1;
+        mbox->words[0] = CELL_EBUSY;
+#ifdef _WIN32
+        WakeAllConditionVariable((CONDITION_VARIABLE*)&mbox->not_full);
+        WakeConditionVariable((CONDITION_VARIABLE*)&mbox->not_empty);
+        ReleaseSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+        pthread_cond_broadcast(&mbox->not_full);
+        pthread_cond_signal(&mbox->not_empty);
+        pthread_mutex_unlock(&mbox->lock);
+#endif
+        return 0;
+    }
+    *slot = mbox->tail;
+    mbox->words[mbox->tail] = CELL_OK;
+    mbox->tail = (mbox->tail + 1) % SPU_IN_MBOX_DEPTH;
+    mbox->count++;
+    reserved = 1;
+#ifdef _WIN32
+    WakeConditionVariable((CONDITION_VARIABLE*)&mbox->not_empty);
+#else
+    pthread_cond_signal(&mbox->not_empty);
+#endif
+#ifdef _WIN32
+    ReleaseSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_unlock(&mbox->lock);
+#endif
+    return reserved;
+}
+
+void spu_in_mbox_update_response(spu_inbound_mailbox* mbox, uint32_t slot, uint32_t value)
+{
+    if (!mbox || slot >= SPU_IN_MBOX_DEPTH) return;
+#ifdef _WIN32
+    AcquireSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_lock(&mbox->lock);
+#endif
+    mbox->words[slot] = value;
+#ifdef _WIN32
+    ReleaseSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_unlock(&mbox->lock);
+#endif
+}
+
+int spu_in_mbox_try_read(spu_inbound_mailbox* mbox, uint32_t* value)
+{
+    int read = 0;
+    if (!mbox || !value) return 0;
+#ifdef _WIN32
+    AcquireSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_lock(&mbox->lock);
+#endif
+    if (mbox->count) {
+        *value = mbox->words[mbox->head];
+        mbox->head = (mbox->head + 1) % SPU_IN_MBOX_DEPTH;
+        mbox->count--;
+        read = 1;
+#ifdef _WIN32
+        WakeConditionVariable((CONDITION_VARIABLE*)&mbox->not_full);
+#else
+        pthread_cond_signal(&mbox->not_full);
+#endif
+    }
+#ifdef _WIN32
+    ReleaseSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_unlock(&mbox->lock);
+#endif
+    return read;
+}
+
+/* SPU kernel operations return one status word.  Replace an unfinished prior
+ * response atomically so the issuing SPU's next RdInMbox always completes. */
+void spu_in_mbox_set_response(spu_inbound_mailbox* mbox, uint32_t value)
+{
+    if (!mbox) return;
+#ifdef _WIN32
+    AcquireSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_lock(&mbox->lock);
+#endif
+    mbox->head = 0;
+    mbox->tail = 1;
+    mbox->count = 1;
+    mbox->words[0] = value;
+#ifdef _WIN32
+    WakeConditionVariable((CONDITION_VARIABLE*)&mbox->not_empty);
+    ReleaseSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_cond_signal(&mbox->not_empty);
+    pthread_mutex_unlock(&mbox->lock);
+#endif
+}
+
+uint32_t spu_in_mbox_read(spu_inbound_mailbox* mbox)
+{
+    uint32_t value = 0;
+    if (!mbox) return 0;
+#ifdef _WIN32
+    AcquireSRWLockExclusive((SRWLOCK*)&mbox->lock);
+    while (!mbox->count)
+        SleepConditionVariableSRW((CONDITION_VARIABLE*)&mbox->not_empty,
+                                  (SRWLOCK*)&mbox->lock, INFINITE, 0);
+    value = mbox->words[mbox->head];
+    mbox->head = (mbox->head + 1) % SPU_IN_MBOX_DEPTH;
+    mbox->count--;
+    WakeConditionVariable((CONDITION_VARIABLE*)&mbox->not_full);
+    ReleaseSRWLockExclusive((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_lock(&mbox->lock);
+    while (!mbox->count)
+        pthread_cond_wait(&mbox->not_empty, &mbox->lock);
+    value = mbox->words[mbox->head];
+    mbox->head = (mbox->head + 1) % SPU_IN_MBOX_DEPTH;
+    mbox->count--;
+    pthread_cond_signal(&mbox->not_full);
+    pthread_mutex_unlock(&mbox->lock);
+#endif
+    return value;
+}
+
+uint32_t spu_in_mbox_count(spu_inbound_mailbox* mbox)
+{
+    uint32_t count;
+    if (!mbox) return 0;
+#ifdef _WIN32
+    AcquireSRWLockShared((SRWLOCK*)&mbox->lock);
+    count = mbox->count;
+    ReleaseSRWLockShared((SRWLOCK*)&mbox->lock);
+#else
+    pthread_mutex_lock(&mbox->lock);
+    count = mbox->count;
+    pthread_mutex_unlock(&mbox->lock);
+#endif
+    return count;
 }
 
 /* Block the calling SPU host thread until `channel` is readable. */
@@ -547,7 +1550,11 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
      * raise above), but only block it when the SPU has actually enabled events
      * (event_mask != 0) -- a masked-off read must return 0 immediately, not
      * park forever. RdInMbox/RdSigNotify park on their PPU producers. */
-    if (channel == SPU_RdInMbox || channel == SPU_RdSigNotify1 || channel == SPU_RdSigNotify2)
+    /* The LV2-owned inbound FIFO has its own producer/consumer condition
+     * variables.  Do not sleep on this transient runner context's CV: a PPU
+     * writer signals the FIFO, not this stack context. */
+    if ((channel == SPU_RdInMbox && !ctx->in_mbox_owner) ||
+        channel == SPU_RdSigNotify1 || channel == SPU_RdSigNotify2)
         spu_ch_wait(ctx, channel, "rdch");
     else if (channel == SPU_RdEventStat && ctx->event_mask != 0)
         spu_ch_wait(ctx, channel, "rdch");
@@ -572,7 +1579,10 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     }
 
     switch (channel) {
-    case SPU_RdInMbox:      v = spu_channel_read(&ctx->ch_in_mbox);     break;
+    case SPU_RdInMbox:
+        v = ctx->in_mbox_owner ? spu_in_mbox_read(ctx->in_mbox_owner)
+                                : spu_channel_read(&ctx->ch_in_mbox);
+        break;
     case SPU_RdSigNotify1:  v = spu_channel_read(&ctx->ch_sig_notify[0]); break;
     case SPU_RdSigNotify2:  v = spu_channel_read(&ctx->ch_sig_notify[1]); break;
     /* The decrementer must actually DECREMENT. Returning the latched WrDec
@@ -629,7 +1639,9 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
                   (unsigned long long)s_cnt[3],(unsigned long long)s_cnt[4],(unsigned long long)s_cnt[5],
                   (unsigned long long)s_cnt[6],(unsigned long long)s_cnt[7], channel); } }
     switch (channel) {
-    case SPU_RdInMbox:       return ctx->ch_in_mbox.count;                 /* readable */
+    case SPU_RdInMbox:       return ctx->in_mbox_owner
+                                   ? spu_in_mbox_count(ctx->in_mbox_owner)
+                                   : ctx->ch_in_mbox.count;                 /* readable */
     case SPU_WrOutMbox:      return SPU_MBOX_DEPTH - ctx->ch_out_mbox.count; /* free slots */
     case SPU_WrOutIntrMbox:  return SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count;
     case SPU_RdSigNotify1:   return ctx->ch_sig_notify[0].count;
@@ -812,9 +1824,15 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
     uint32_t num = raw & 0x0F;
-    { static int _n = 0; if (_n++ < 24)
-        fprintf(stderr, "[spu] SPURS taskset syscall num=%u (raw=0x%X args=0x%08X) image=%d link/r0=0x%05X\n",
-                num, raw, ctx->gpr[4]._u32[0], ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
+    { static int _n = 0; static int _limit = -1;
+      if (_limit < 0) {
+          const char* e = getenv("SPU_SYSCALL_LIMIT");
+          _limit = e ? atoi(e) : 24;
+          if (_limit < 1) _limit = 1;
+      }
+      if (_n++ < _limit)
+          fprintf(stderr, "[spu] SPURS taskset syscall num=%u (raw=0x%X args=0x%08X) image=%d link/r0=0x%05X\n",
+                  num, raw, ctx->gpr[4]._u32[0], ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
     /* NOTE (YDKJ cri_mpv): the cri task's BOOTSTRAP (func_00003040) calls the
      * task-API syscall and EXPECTS IT TO RETURN, then branches to the real task
      * entry (0x3050). Halting on num=0 here kills the task at bootstrap before it
@@ -824,6 +1842,20 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * For non-cri images keep the fork's EXIT=halt semantics. Env YDKJ_CRI_EXIT_HALT
      * forces the old halt behaviour for comparison. */
     if (num == 0 && (ctx->image_id != 22 || getenv("YDKJ_CRI_EXIT_HALT"))) {
+        uint32_t ts  = ((uint32_t)ctx->ls[STC_TASKSET_PTR + 4] << 24) |
+                       ((uint32_t)ctx->ls[STC_TASKSET_PTR + 5] << 16) |
+                       ((uint32_t)ctx->ls[STC_TASKSET_PTR + 6] << 8)  |
+                        (uint32_t)ctx->ls[STC_TASKSET_PTR + 7];
+        uint32_t tid = ((uint32_t)ctx->ls[STC_TASK_ID + 0] << 24) |
+                       ((uint32_t)ctx->ls[STC_TASK_ID + 1] << 16) |
+                       ((uint32_t)ctx->ls[STC_TASK_ID + 2] << 8)  |
+                        (uint32_t)ctx->ls[STC_TASK_ID + 3];
+        int32_t exit_code = (int32_t)(((uint32_t)ctx->ls[STC_TASK_EXIT_CODE + 0] << 24) |
+                                      ((uint32_t)ctx->ls[STC_TASK_EXIT_CODE + 1] << 16) |
+                                      ((uint32_t)ctx->ls[STC_TASK_EXIT_CODE + 2] << 8)  |
+                                       (uint32_t)ctx->ls[STC_TASK_EXIT_CODE + 3]);
+        if (ts && tid < 128)
+            spu_taskset_mark_task_exit(ts, tid, exit_code);
         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
         spu_halt(ctx);          /* longjmp out to spu_run_with_halt; post-run writes exit code */
         return;
@@ -843,15 +1875,23 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
         uint32_t tid = ((uint32_t)ctx->ls[0x27D4] << 24) | ((uint32_t)ctx->ls[0x27D5] << 16) |
                        ((uint32_t)ctx->ls[0x27D6] << 8)  |  (uint32_t)ctx->ls[0x27D7];
         if (ts) {
-            extern int spu_taskset_wait_signal(uint32_t, uint32_t);
             /* Park = OS-level wait on this SPU's host thread. Under the lockstep
              * gate the thread HOLDS the global run token here; parking without
              * releasing it starves every other lifted SPU (observed: FMOD task 1
              * parks in WAIT_SIGNAL holding the token -> the mixer never runs
              * again -> the PPU audio pump blocks forever on flag 0x94F600). */
             yz_lockstep_block_begin(ctx);
-            spu_taskset_wait_signal(ts, tid);
+            /* ctx->pc is the syscall sentinel; r0 contains the lifted caller's
+             * return site and is the useful attribution key. */
+            int wait_rc = spu_taskset_wait_signal(
+                ts, tid, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
             yz_lockstep_block_end(ctx);
+            if (wait_rc > 0) {
+                spu_taskset_mark_task_exit(ts, tid, 0);
+                ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+                spu_halt(ctx);
+                return;
+            }
         }
         ctx->gpr[3]._u32[0] = 0;
         return;
@@ -868,134 +1908,44 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
  * stub above the static image (LS 0x3FEC0: a chain of stqd/lqd plus a `bi`
  * terminator, written at interrupt entry) and calls it. No lift can exist for
  * bytes that only come into being at runtime, so when the indirect dispatch
- * finds no registered function we interpret the LIVE LS bytes directly for
- * the small instruction set such stubs use, and exit back into lifted code at
- * the first branch (trampoline re-dispatch). Returns 1 if it executed to a
- * branch, 0 on an unknown opcode (caller falls through to BRANCH-TO-0). */
+ * finds no registered function we execute the LIVE LS bytes through the full
+ * interpreter one instruction at a time, and exit back into lifted code at a
+ * taken branch (trampoline re-dispatch). */
 static int spu_smc_microstep(spu_context* ctx)
 {
     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
     for (int steps = 0; steps < 4096; steps++) {
-        uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
-                     ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
-        uint32_t op11 = w >> 21, op9 = w >> 23, op8 = w >> 24, op7 = w >> 25;
-        uint32_t rt = w & 0x7F, ra = (w >> 7) & 0x7F, rb = (w >> 14) & 0x7F;
-        int32_t  i10 = (int32_t)(w << 8) >> 22;               /* bits 14-23 sext */
-        int32_t  i16 = (int32_t)(int16_t)((w >> 7) & 0xFFFF);
-        (void)rb;
-
-        if (op11 == 0x1A8 || op11 == 0x1A9 || op11 == 0x1AA || op11 == 0x1AB) {
-            /* bi / bisl / iret / bisled (+E/D interrupt bits) */
-            if (op11 == 0x1AB &&                       /* bisled: only on event */
-                (ctx->event_status & ctx->event_mask) == 0) { pc += 4; continue; }
-            if (w & 0x40000) ctx->int_enable = 1;
-            else if (w & 0x80000) ctx->int_enable = 0;
-            uint32_t tgt = (op11 == 0x1AA) ? ctx->srr0
-                                           : ctx->gpr[ra]._u32[0];
-            if (op11 == 0x1A9 || op11 == 0x1AB)
-                ctx->gpr[rt] = spu_splat_u32(pc + 4);
-            ctx->pc = tgt & SPU_LS_MASK & ~3u;
+        uint32_t step_pc = pc;
+        int branch_taken;
+        ctx->pc = step_pc;
+        if (spu_interp_step(ctx, &branch_taken)) {
+            /* Match lifted terminal instructions: HALT unwinds nested calls,
+             * while STOP retains the runtime's stop-and-signal policy. */
+            if (ctx->status & SPU_STATUS_STOPPED_BY_HALT)
+                spu_halt(ctx);
+            else if (ctx->status & SPU_STATUS_STOPPED_BY_STOP)
+                spu_stop(ctx);
+            return 1;
+        }
+        if (branch_taken) {
             g_spu_trampoline_fn = spu_indirect_branch;
             return 1;
         }
-        if (op11 >= 0x128 && op11 <= 0x12B) {
-            /* biz / binz / bihz / bihnz rt,ra (+E/D bits, taken-only) */
-            uint32_t cv = ctx->gpr[rt]._u32[0];
-            int taken;
-            switch (op11) {
-            case 0x128: taken = (cv == 0); break;                     /* biz  */
-            case 0x129: taken = (cv != 0); break;                     /* binz */
-            case 0x12A: taken = ((cv & 0xFFFF) == 0); break;          /* bihz */
-            default:    taken = ((cv & 0xFFFF) != 0); break;          /* bihnz*/
-            }
-            if (!taken) { pc += 4; continue; }
-            if (w & 0x40000) ctx->int_enable = 1;
-            else if (w & 0x80000) ctx->int_enable = 0;
-            ctx->pc = ctx->gpr[ra]._u32[0] & SPU_LS_MASK & ~3u;
-            g_spu_trampoline_fn = spu_indirect_branch;
-            return 1;
+        pc = ctx->pc & SPU_LS_MASK & ~3u;
+        if (pc == step_pc) {
+            static int _n = 0;
+            if (_n++ < 8)
+                fprintf(stderr, "[spu-smc] microstep img=%d no progress at pc=0x%05X\n",
+                        ctx->image_id, pc);
+            ctx->pc = pc;
+            return 0;                  /* retain full-interpreter fallback */
         }
-        if (op9 == 0x064 || op9 == 0x060 || op9 == 0x066 || op9 == 0x062) {
-            /* br / bra / brsl / brasl */
-            uint32_t tgt = (op9 == 0x060 || op9 == 0x062)
-                         ? ((uint32_t)i16 << 2)
-                         : (pc + ((uint32_t)i16 << 2));
-            if (op9 == 0x066 || op9 == 0x062)
-                ctx->gpr[rt] = spu_splat_u32(pc + 4);
-            ctx->pc = tgt & SPU_LS_MASK & ~3u;
-            g_spu_trampoline_fn = spu_indirect_branch;
-            return 1;
-        }
-        if (op9 == 0x040 || op9 == 0x042 || op9 == 0x044 || op9 == 0x046) {
-            /* brz / brnz / brhz / brhnz rt,label (relative) */
-            uint32_t cv = ctx->gpr[rt]._u32[0];
-            int taken;
-            switch (op9) {
-            case 0x040: taken = (cv == 0); break;
-            case 0x042: taken = (cv != 0); break;
-            case 0x044: taken = ((cv & 0xFFFF) == 0); break;
-            default:    taken = ((cv & 0xFFFF) != 0); break;
-            }
-            if (!taken) { pc += 4; continue; }
-            ctx->pc = (pc + ((uint32_t)i16 << 2)) & SPU_LS_MASK & ~3u;
-            g_spu_trampoline_fn = spu_indirect_branch;
-            return 1;
-        }
-        if (op8 == 0x24) {                                    /* stqd rt,i10(ra) */
-            uint32_t a = (ctx->gpr[ra]._u32[0] + ((uint32_t)i10 << 4)) & SPU_LS_MASK & ~15u;
-            spu_ls_write128(ctx, a, ctx->gpr[rt]);
-            pc += 4; continue;
-        }
-        if (op8 == 0x34) {                                    /* lqd rt,i10(ra) */
-            uint32_t a = (ctx->gpr[ra]._u32[0] + ((uint32_t)i10 << 4)) & SPU_LS_MASK & ~15u;
-            ctx->gpr[rt] = spu_ls_read128(ctx, a);
-            pc += 4; continue;
-        }
-        if (op9 == 0x041 || op9 == 0x061) {                   /* stqa / lqa (abs) */
-            uint32_t a = (((w >> 7) & 0xFFFF) << 4) & SPU_LS_MASK & ~15u;
-            if (op9 == 0x041) spu_ls_write128(ctx, a, ctx->gpr[rt]);
-            else              ctx->gpr[rt] = spu_ls_read128(ctx, a);
-            pc += 4; continue;
-        }
-        if (op9 == 0x047 || op9 == 0x067) {                   /* stqr / lqr (rel) */
-            uint32_t a = (pc + ((uint32_t)i16 << 2)) & SPU_LS_MASK & ~15u;
-            if (op9 == 0x047) spu_ls_write128(ctx, a, ctx->gpr[rt]);
-            else              ctx->gpr[rt] = spu_ls_read128(ctx, a);
-            pc += 4; continue;
-        }
-        if (op8 == 0x1C) {                                    /* ai rt,ra,i10 */
-            u128 r = ctx->gpr[ra];
-            for (int k = 0; k < 4; k++) r._u32[k] += (uint32_t)i10;
-            ctx->gpr[rt] = r; pc += 4; continue;
-        }
-        if (op11 == 0x040 || op11 == 0x0C0) {                 /* sf / a (word) */
-            u128 x = ctx->gpr[ra], y = ctx->gpr[rb], r;
-            for (int k = 0; k < 4; k++)
-                r._u32[k] = (op11 == 0x040) ? y._u32[k] - x._u32[k]
-                                            : x._u32[k] + y._u32[k];
-            ctx->gpr[rt] = r; pc += 4; continue;
-        }
-        if (op9 == 0x081) { ctx->gpr[rt] = spu_splat_u32((uint32_t)i16); pc += 4; continue; }  /* il  */
-        if (op9 == 0x082) { ctx->gpr[rt] = spu_splat_u32(((w >> 7) & 0xFFFF) << 16); pc += 4; continue; } /* ilhu */
-        if (op9 == 0x0C1) { u128 r = ctx->gpr[rt];            /* iohl */
-            for (int k = 0; k < 4; k++) r._u32[k] |= (w >> 7) & 0xFFFF;
-            ctx->gpr[rt] = r; pc += 4; continue; }
-        if (op7 == 0x21)  { ctx->gpr[rt] = spu_splat_u32((w >> 7) & 0x3FFFF); pc += 4; continue; } /* ila */
-        if (op11 == 0x201 || op11 == 0x001) { pc += 4; continue; }  /* nop/lnop */
-        if (op11 == 0x002 || op11 == 0x003) { pc += 4; continue; }  /* sync/dsync */
-        if (op11 == 0x1AC || op9 == 0x008 || op9 == 0x009) { pc += 4; continue; } /* hbr hints */
-
-        { static int _n = 0;
-          if (_n++ < 8)
-              fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X UNKNOWN word 0x%08X "
-                      "(steps=%d from 0x%05X)\n", ctx->image_id, pc, w, steps,
-                      ctx->pc & SPU_LS_MASK); }
-        return 0;
     }
     { static int _n = 0; if (_n++ < 4)
         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
                 ctx->image_id, ctx->pc & SPU_LS_MASK); }
-    return 0;
+    ctx->pc = pc;
+    return 0;                          /* retain full-interpreter fallback */
 }
 
 void spu_indirect_branch(spu_context* ctx)
@@ -1125,6 +2075,20 @@ void spu_indirect_branch(spu_context* ctx)
             fflush(stderr);
         } }
     }
+    /* A directly-dispatched jm2 job returns to the job manager by branching to
+     * LS 0. Every registered raw job image has its native entry there, so
+     * resolving the hand-back as a fresh entry re-enters its CRT with dead
+     * r3/r4 and can spin in bogus DMA. The initial entry is called directly,
+     * never through this resolver; policy/task contexts use policy_mode. */
+    if (ctx->image_id != 0 && !ctx->policy_mode && ctx->pc == 0) {
+        static int _n = 0;
+        if (_n++ < 8)
+            fprintf(stderr, "[spurs-job] return-to-manager at LS 0; job complete\n");
+        ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+        spu_halt(ctx);
+        return;
+    }
+
     /* Resident overlay FIRST: streamed code overwrote that LS range, so its
      * lift is the truth there -- the base image's stale bytes at the same
      * addresses may also be registered (historical junk lifts) and must lose. */
@@ -1375,6 +2339,25 @@ void spu_indirect_branch(spu_context* ctx)
      * branch re-enters lifted code via the trampoline. */
     if (spu_smc_microstep(ctx))
         return;
+    /* Only a bounded no-progress/runaway exit reaches this fallback. Resume
+     * the complete interpreter from the current live-LS PC. */
+    {
+        uint32_t interp_start = ctx->pc & SPU_LS_MASK & ~3u;
+        uint32_t interp_next = spu_interp_run(ctx, interp_start);
+        if (ctx->status & SPU_STATUS_STOPPED_BY_HALT) {
+            spu_halt(ctx);
+            return;
+        }
+        if (ctx->status & SPU_STATUS_STOPPED_BY_STOP) {
+            spu_stop(ctx);
+            return;
+        }
+        if ((interp_next & SPU_LS_MASK & ~3u) != interp_start) {
+            ctx->pc = interp_next & SPU_LS_MASK & ~3u;
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return;
+        }
+    }
     /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy
      * image (the FMOD mixer's overlay calls) exhaust it and silently hide
      * every other image's misses -- LBP's loading jobs skipped their command
@@ -1510,6 +2493,46 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
       if (s_ti == -2) { const char* e = getenv("SPU_TRACE_IMG");
                         s_ti = e ? atoll(e) : -1; }
       if (s_ti >= 0 && ctx->image_id != (int)s_ti) { s_trace_suppress = 1; return; } }
+    /* SPU_TRACE_TASK=<n>: for taskset-backed images, trace only one task.
+     * The task id is the BE u32 planted by spurs_pm_build_context at LS
+     * 0x27D4.  This keeps two persistent workers from interleaving into one
+     * unusable instruction stream while diagnosing task-specific stalls. */
+    { static int64_t s_tt = -2;
+      if (s_tt == -2) { const char* e = getenv("SPU_TRACE_TASK");
+                        s_tt = e ? atoll(e) : -1; }
+      if (s_tt >= 0) {
+          uint32_t task_id = ((uint32_t)ctx->ls[0x27D4] << 24) |
+                             ((uint32_t)ctx->ls[0x27D5] << 16) |
+                             ((uint32_t)ctx->ls[0x27D6] << 8)  |
+                              (uint32_t)ctx->ls[0x27D7];
+          if (task_id != (uint32_t)s_tt) { s_trace_suppress = 1; return; }
+      } }
+    /* SPU_TRACE_AFTER_WAIT=<n>: arm after this task thread has returned from
+     * WAIT_SIGNAL n times.  Useful for persistent tasks whose first work pass
+     * contains millions of instructions but whose later empty/terminal pass
+     * decides whether a completion is emitted. */
+    { static int64_t s_tw = -2;
+      if (s_tw == -2) { const char* e = getenv("SPU_TRACE_AFTER_WAIT");
+                        s_tw = e ? atoll(e) : -1; }
+      if (s_tw >= 0) {
+          extern _Thread_local uint32_t g_spu_trace_wait_count;
+          if (g_spu_trace_wait_count < (uint32_t)s_tw) {
+              s_trace_suppress = 1; return;
+          }
+      } }
+    /* Optional inclusive/exclusive PC window.  Keep scheduler/control-flow
+     * evidence while excluding a worker's million-instruction SIMD kernels. */
+    { static uint32_t s_pc_lo, s_pc_hi; static int s_pc_init;
+      if (!s_pc_init) {
+          const char* lo = getenv("SPU_TRACE_PC_LO");
+          const char* hi = getenv("SPU_TRACE_PC_HI");
+          s_pc_lo = lo ? (uint32_t)strtoul(lo, NULL, 0) : 0;
+          s_pc_hi = hi ? (uint32_t)strtoul(hi, NULL, 0) : 0;
+          s_pc_init = 1;
+      }
+      if ((s_pc_lo && pc < s_pc_lo) || (s_pc_hi && pc >= s_pc_hi)) {
+          s_trace_suppress = 1; return;
+      } }
     s_trace_suppress = 0;
     if (s_trace_left < 0) {
         if (s_trace_left == -1) {

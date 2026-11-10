@@ -6,7 +6,9 @@
 
 #include "cellGame.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
+#include "../../runtime/memory/vm.h"         /* ppu_vm_size */
 #include "ps3emu/guest_call.h"              /* g_ps3_guest_caller (funcStat dispatch) */
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -42,7 +44,10 @@ static char s_content_path[CELL_GAME_PATH_MAX] = "./gamedata/dev_hdd0/game";
 static char s_content_info_path[CELL_GAME_PATH_MAX] = "";
 static char s_usrdir_path[CELL_GAME_PATH_MAX] = "";
 static char s_tmp_path[CELL_GAME_PATH_MAX] = "";
+static char s_tmp_final_path[CELL_GAME_PATH_MAX] = "";
 static char s_exit_param[256] = "";
+static int  s_tmp_pending = 0;
+static unsigned s_create_serial = 0;
 
 static int  s_boot_checked = 0;
 static u32  s_game_type = CELL_GAME_GAMETYPE_DISC;
@@ -56,21 +61,35 @@ static u32  s_game_type = CELL_GAME_GAMETYPE_DISC;
 static int  s_check_is_disc = 1;
 static char s_check_dir[64] = "";
 
-static void ensure_dirs(const char* path)
+#define CELL_GAME_HOST_PATH_MAX 1024
+
+extern int ppu_fs_resolve_host_path(const char* guest, char* out, size_t cap);
+
+static int ensure_dirs(const char* path)
 {
-    char tmp[CELL_GAME_PATH_MAX];
+    char tmp[CELL_GAME_HOST_PATH_MAX];
+    if (!path || !*path || strlen(path) >= sizeof(tmp))
+        return 0;
     strncpy(tmp, path, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
 
-    for (char* p = tmp + 1; *p; p++) {
+    char* first = tmp + 1;
+#ifdef _WIN32
+    if (tmp[0] && tmp[1] == ':')
+        first = tmp + 3;
+#endif
+    for (char* p = first; *p; p++) {
         if (*p == '/' || *p == '\\') {
             char saved = *p;
             *p = '\0';
-            HOST_MKDIR(tmp);
+            if (*tmp && HOST_MKDIR(tmp) != 0 && errno != EEXIST) {
+                *p = saved;
+                return 0;
+            }
             *p = saved;
         }
     }
-    HOST_MKDIR(tmp);
+    return HOST_MKDIR(tmp) == 0 || errno == EEXIST;
 }
 
 static int dir_exists(const char* path)
@@ -200,6 +219,59 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
     if (sfo_read_string(sfo_path, "APP_VER", tmp, sizeof(tmp)) == 0 && tmp[0]) {
         strncpy(s_app_ver, tmp, sizeof(s_app_ver) - 1); s_app_ver[sizeof(s_app_ver) - 1] = '\0';
     }
+    /* CATEGORY describes how this executable was installed. Reporting every
+     * title as a disc makes PSN games request /dev_bdvd/PS3_GAME and run their
+     * disc-install path even though their files already live on /dev_hdd0.
+     * Common retail categories are DG (disc game) and HG (HDD/PSN game). */
+    if (sfo_read_string(sfo_path, "CATEGORY", tmp, sizeof(tmp)) == 0) {
+        if (strcmp(tmp, "HG") == 0)
+            s_game_type = CELL_GAME_GAMETYPE_HDD;
+        else if (strcmp(tmp, "DG") == 0)
+            s_game_type = CELL_GAME_GAMETYPE_DISC;
+        printf("[cellGame] category='%s' -> boot type=%u\n", tmp, s_game_type);
+    }
+}
+
+static int guest_range_valid(uint32_t ea, size_t size)
+{
+    if (!ea || size == 0)
+        return 0;
+    return !ppu_vm_size || ((uint64_t)ea + size <= ppu_vm_size);
+}
+
+static int guest_copy_string(uint32_t ea, char* out, size_t cap, int allow_empty)
+{
+    if (!out || cap < 2 || !guest_range_valid(ea, 1))
+        return 0;
+    for (size_t i = 0; i < cap; ++i) {
+        if (!guest_range_valid(ea + (uint32_t)i, 1))
+            return 0;
+        out[i] = (char)vm_base[ea + i];
+        if (!out[i])
+            return allow_empty || i != 0;
+    }
+    out[0] = 0;
+    return 0;
+}
+
+static int guest_write_string(uint32_t ea, const char* value)
+{
+    const size_t size = value ? strlen(value) + 1 : 0;
+    if (!value || size > CELL_GAME_PATH_MAX || !guest_range_valid(ea, size))
+        return 0;
+    memcpy(vm_base + ea, value, size);
+    return 1;
+}
+
+static int valid_title_id(const char* title_id)
+{
+    if (!title_id || strlen(title_id) != 9)
+        return 0;
+    for (const unsigned char* p = (const unsigned char*)title_id; *p; ++p) {
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9')))
+            return 0;
+    }
+    return 1;
 }
 
 /* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
@@ -233,6 +305,12 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     uint32_t size_ea = (uint32_t)(uintptr_t)size;
     uint32_t dir_ea  = (uint32_t)(uintptr_t)dirName;
 
+    if ((type_ea && !guest_range_valid(type_ea, 4)) ||
+        (attr_ea && !guest_range_valid(attr_ea, 4)) ||
+        (size_ea && !guest_range_valid(size_ea, sizeof(CellGameContentSize))) ||
+        (dir_ea && !guest_range_valid(dir_ea, CELL_GAME_DIRNAME_SIZE)))
+        return CELL_GAME_ERROR_PARAM;
+
     if (type_ea) vm_write32(type_ea, (uint32_t)s_game_type);
     if (attr_ea) vm_write32(attr_ea, 0);
 
@@ -264,6 +342,23 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
     printf("[cellGame] ContentPermit() -> %s\n",
            s_check_is_disc ? "/dev_bdvd/PS3_GAME" : "game-data dir");
 
+    if (s_tmp_pending) {
+        char tmp_host[CELL_GAME_HOST_PATH_MAX];
+        char final_host[CELL_GAME_HOST_PATH_MAX];
+        if (!ppu_fs_resolve_host_path(s_tmp_path, tmp_host, sizeof(tmp_host)) ||
+            !ppu_fs_resolve_host_path(s_tmp_final_path, final_host, sizeof(final_host)))
+            return CELL_GAME_ERROR_ACCESS_ERROR;
+        if (dir_exists(final_host))
+            return CELL_GAME_ERROR_EXIST;
+        if (rename(tmp_host, final_host) != 0)
+            return CELL_GAME_ERROR_ACCESS_ERROR;
+        s_tmp_pending = 0;
+        strncpy(s_check_dir, strrchr(s_tmp_final_path, '/') + 1,
+                sizeof(s_check_dir) - 1);
+        s_check_dir[sizeof(s_check_dir) - 1] = '\0';
+        s_check_is_disc = 0;
+    }
+
     if (!s_check_is_disc) {
         /* Ensure directories exist. IMPORTANT: also create them at the SAME host
          * location the VFS (ppu_fs.cpp host_path) maps /dev_hdd0/game/<title>/ to,
@@ -271,14 +366,12 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
          * ./gamedata/dev_hdd0/game/... which cellFs never looks at, so a game that
          * polls cellFsStat for its game-data USRDIR (LBP's boot bringup stage) stalls
          * forever and exits. Create it where cellFs will actually find it. */
-        ensure_dirs(s_content_info_path);
-        ensure_dirs(s_usrdir_path);
-        {
-            extern const char* ppu_vfs_root;
-            char vpath[CELL_GAME_PATH_MAX];
-            snprintf(vpath, sizeof vpath, "%s/game/%s/USRDIR", ppu_vfs_root, s_check_dir);
-            ensure_dirs(vpath);
-        }
+        char guest_usr[CELL_GAME_PATH_MAX];
+        char host_usr[CELL_GAME_HOST_PATH_MAX];
+        snprintf(guest_usr, sizeof guest_usr, "/dev_hdd0/game/%s/USRDIR", s_check_dir);
+        if (!ppu_fs_resolve_host_path(guest_usr, host_usr, sizeof(host_usr)) ||
+            !ensure_dirs(host_usr))
+            return CELL_GAME_ERROR_ACCESS_ERROR;
     }
 
     /* Both paths are GUEST addresses; format into a host temp, copy into the
@@ -292,13 +385,15 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
         int n = s_check_is_disc
               ? snprintf(tmp, sizeof tmp, "/dev_bdvd/PS3_GAME")
               : snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s", s_check_dir);
-        memcpy(vm_base + cip_ea, tmp, (size_t)n + 1);
+        if (n < 0 || !guest_write_string(cip_ea, tmp))
+            return CELL_GAME_ERROR_PARAM;
     }
     if (usr_ea) {
         int n = s_check_is_disc
               ? snprintf(tmp, sizeof tmp, "/dev_bdvd/PS3_GAME/USRDIR")
               : snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s/USRDIR", s_check_dir);
-        memcpy(vm_base + usr_ea, tmp, (size_t)n + 1);
+        if (n < 0 || !guest_write_string(usr_ea, tmp))
+            return CELL_GAME_ERROR_PARAM;
     }
 
     return CELL_OK;
@@ -310,7 +405,17 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
      * printf'd the raw EA as a host char* and crashed (LBP: read fault at
      * 0x94AEA0 = the guest EA of its dir string). */
     uint32_t dir_ea = (uint32_t)(uintptr_t)dirName;   /* guest addr */
-    const char* check_dir = dir_ea ? (const char*)(vm_base + dir_ea) : s_title_id;
+    uint32_t size_ea = (uint32_t)(uintptr_t)size;
+    char check_dir_buf[CELL_GAME_DIRNAME_SIZE];
+    const char* check_dir = s_title_id;
+    if (type < CELL_GAME_GAMETYPE_DISC || type > CELL_GAME_GAMETYPE_HOME ||
+        (size_ea && !guest_range_valid(size_ea, sizeof(CellGameContentSize))))
+        return CELL_GAME_ERROR_PARAM;
+    if (dir_ea) {
+        if (!guest_copy_string(dir_ea, check_dir_buf, sizeof(check_dir_buf), 0))
+            return CELL_GAME_ERROR_PARAM;
+        check_dir = check_dir_buf;
+    }
     printf("[cellGame] DataCheck(type=%u, dir='%s')\n", type, check_dir);
 
     /* Open a check session for this content; the next ContentPermit reports
@@ -319,10 +424,12 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
     strncpy(s_check_dir, check_dir, sizeof(s_check_dir) - 1);
     s_check_dir[sizeof(s_check_dir) - 1] = '\0';
 
-    char path[CELL_GAME_PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", s_content_path, check_dir);
+    char guest_path[CELL_GAME_PATH_MAX];
+    char host_path[CELL_GAME_HOST_PATH_MAX];
+    snprintf(guest_path, sizeof(guest_path), "/dev_hdd0/game/%s", check_dir);
+    if (!ppu_fs_resolve_host_path(guest_path, host_path, sizeof(host_path)))
+        return CELL_GAME_ERROR_ACCESS_ERROR;
 
-    uint32_t size_ea = (uint32_t)(uintptr_t)size;
     if (size_ea) {
         vm_write32(size_ea + 0, 1024 * 1024);
         vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
@@ -335,7 +442,7 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
     if (type == 1)
         return CELL_OK;
 
-    if (dir_exists(path)) {
+    if (dir_exists(host_path)) {
         return CELL_OK;
     }
 
@@ -468,39 +575,99 @@ s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
     return CELL_OK;
 }
 
+s32 cellGameSetParamString(s32 id, const char* value)
+{
+    const uint32_t value_ea = (uint32_t)(uintptr_t)value;
+    char host_value[256];
+    if (!guest_copy_string(value_ea, host_value, sizeof(host_value), 1))
+        return CELL_GAME_ERROR_PARAM;
+
+    char* dst = NULL;
+    size_t cap = 0;
+    if (id >= CELL_GAME_PARAMID_TITLE && id <= CELL_GAME_PARAMID_TITLE_TURKISH) {
+        dst = s_title;
+        cap = sizeof(s_title);
+    } else {
+        switch (id) {
+        case CELL_GAME_PARAMID_TITLE_ID:       dst = s_title_id;   cap = sizeof(s_title_id); break;
+        case CELL_GAME_PARAMID_VERSION:        dst = s_version;    cap = sizeof(s_version); break;
+        case CELL_GAME_PARAMID_PS3_SYSTEM_VER: dst = s_system_ver; cap = sizeof(s_system_ver); break;
+        case CELL_GAME_PARAMID_APP_VER:        dst = s_app_ver;    cap = sizeof(s_app_ver); break;
+        default: return CELL_GAME_ERROR_PARAM;
+        }
+    }
+
+    strncpy(dst, host_value, cap - 1);
+    dst[cap - 1] = '\0';
+    return CELL_OK;
+}
+
 s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPath,
                             char* tmp_usrdirPath)
 {
     printf("[cellGame] CreateGameData()\n");
 
     uint32_t init_ea = (uint32_t)(uintptr_t)init;   /* guest addrs */
-    if (!init_ea)
-        return CELL_GAME_ERROR_PARAM;
-
-    char path[CELL_GAME_PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", s_content_path, s_title_id);
-
-    ensure_dirs(path);
-
-    /* Also create USRDIR */
-    char usrdir[CELL_GAME_PATH_MAX];
-    snprintf(usrdir, sizeof(usrdir), "%s/USRDIR", path);
-    ensure_dirs(usrdir);
-
     uint32_t cip_ea = (uint32_t)(uintptr_t)tmp_contentInfoPath;
     uint32_t usr_ea = (uint32_t)(uintptr_t)tmp_usrdirPath;
-    if (cip_ea) {
-        size_t len = strlen(path);
-        if (len > CELL_GAME_PATH_MAX - 1) len = CELL_GAME_PATH_MAX - 1;
-        memcpy(vm_base + cip_ea, path, len);
-        vm_base[cip_ea + len] = '\0';
+    if (!guest_range_valid(init_ea, sizeof(CellGameSetInitParams)) ||
+        !guest_range_valid(cip_ea, CELL_GAME_PATH_MAX) ||
+        !guest_range_valid(usr_ea, CELL_GAME_PATH_MAX))
+        return CELL_GAME_ERROR_PARAM;
+
+    if (s_tmp_pending)
+        return CELL_GAME_ERROR_BUSY;
+
+    CellGameSetInitParams params;
+    memcpy(&params, vm_base + init_ea, sizeof(params));
+    params.title[sizeof(params.title) - 1] = '\0';
+    params.titleId[sizeof(params.titleId) - 1] = '\0';
+    params.version[sizeof(params.version) - 1] = '\0';
+    if (!valid_title_id(params.titleId))
+        return CELL_GAME_ERROR_INVALID_ID;
+
+    char temp_guest[CELL_GAME_PATH_MAX];
+    char temp_usr_guest[CELL_GAME_PATH_MAX];
+    char final_guest[CELL_GAME_PATH_MAX];
+    char temp_host[CELL_GAME_HOST_PATH_MAX];
+    char temp_usr_host[CELL_GAME_HOST_PATH_MAX];
+    int found = 0;
+    for (unsigned attempt = 0; attempt < 1024; ++attempt) {
+        const unsigned serial = ++s_create_serial;
+        snprintf(temp_guest, sizeof(temp_guest),
+                 "/dev_hdd0/game/_GDATA_%08X", serial);
+        if (!ppu_fs_resolve_host_path(temp_guest, temp_host, sizeof(temp_host)))
+            return CELL_GAME_ERROR_ACCESS_ERROR;
+        if (!dir_exists(temp_host)) {
+            found = 1;
+            break;
+        }
     }
-    if (usr_ea) {
-        size_t len = strlen(usrdir);
-        if (len > CELL_GAME_PATH_MAX - 1) len = CELL_GAME_PATH_MAX - 1;
-        memcpy(vm_base + usr_ea, usrdir, len);
-        vm_base[usr_ea + len] = '\0';
-    }
+    if (!found)
+        return CELL_GAME_ERROR_BUSY;
+
+    snprintf(temp_usr_guest, sizeof(temp_usr_guest), "%s/USRDIR", temp_guest);
+    snprintf(final_guest, sizeof(final_guest), "/dev_hdd0/game/%s", params.titleId);
+    if (!ppu_fs_resolve_host_path(temp_usr_guest, temp_usr_host, sizeof(temp_usr_host)) ||
+        !ensure_dirs(temp_usr_host))
+        return CELL_GAME_ERROR_ACCESS_ERROR;
+
+    if (!guest_write_string(cip_ea, temp_guest) ||
+        !guest_write_string(usr_ea, temp_usr_guest))
+        return CELL_GAME_ERROR_PARAM;
+
+    strncpy(s_title, params.title, sizeof(s_title) - 1);
+    s_title[sizeof(s_title) - 1] = '\0';
+    strncpy(s_app_ver, params.version, sizeof(s_app_ver) - 1);
+    s_app_ver[sizeof(s_app_ver) - 1] = '\0';
+    strncpy(s_tmp_path, temp_guest, sizeof(s_tmp_path) - 1);
+    s_tmp_path[sizeof(s_tmp_path) - 1] = '\0';
+    strncpy(s_tmp_final_path, final_guest, sizeof(s_tmp_final_path) - 1);
+    s_tmp_final_path[sizeof(s_tmp_final_path) - 1] = '\0';
+    s_tmp_pending = 1;
+    s_check_is_disc = 0;
+    strncpy(s_check_dir, params.titleId, sizeof(s_check_dir) - 1);
+    s_check_dir[sizeof(s_check_dir) - 1] = '\0';
 
     return CELL_OK;
 }
@@ -538,11 +705,12 @@ s32 cellGameGetLocalWebContentPath(char* path)
 {
     printf("[cellGame] GetLocalWebContentPath()\n");
 
-    if (!path)
-        return CELL_GAME_ERROR_PARAM;
-
-    snprintf(path, CELL_GAME_PATH_MAX,
+    uint32_t path_ea = (uint32_t)(uintptr_t)path;
+    char guest_path[CELL_GAME_PATH_MAX];
+    snprintf(guest_path, sizeof(guest_path),
              "/dev_hdd0/game/%s/USRDIR/web", s_title_id);
+    if (!guest_write_string(path_ea, guest_path))
+        return CELL_GAME_ERROR_PARAM;
 
     return CELL_OK;
 }

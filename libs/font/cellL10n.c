@@ -473,71 +473,70 @@ s32 l10n_convert(u32 src_encoding, const void* src, u32 src_len,
 {
     if (!src || !dst || !dst_len)
         return (s32)CELL_L10N_ERROR_INVALID_PARAM;
+    *dst_len = 0;
+    if (!((src_encoding <= L10N_UCS2 || src_encoding == L10N_ISO_8859_1 ||
+           src_encoding == L10N_ASCII) &&
+          (dst_encoding <= L10N_UCS2 || dst_encoding == L10N_ISO_8859_1 ||
+           dst_encoding == L10N_ASCII)))
+        return (s32)CELL_L10N_ERROR_NOT_SUPPORTED;
 
-    /* UTF-8 -> UTF-16 */
-    if (src_encoding == L10N_UTF8 && dst_encoding == L10N_UTF16) {
-        u32 out_len = dst_max / sizeof(u16);
-        s32 rc = UTF8toUTF16((const u8*)src, src_len,
-                             (u16*)dst, &out_len);
-        *dst_len = out_len * sizeof(u16);
-        return rc;
-    }
-
-    /* UTF-16 -> UTF-8 */
-    if (src_encoding == L10N_UTF16 && dst_encoding == L10N_UTF8) {
-        u32 out_len = dst_max;
-        s32 rc = UTF16toUTF8((const u16*)src, src_len / sizeof(u16),
-                             (u8*)dst, &out_len);
-        *dst_len = out_len;
-        return rc;
-    }
-
-    /* Same encoding - just copy */
-    if (src_encoding == dst_encoding) {
-        u32 copy_len = src_len < dst_max ? src_len : dst_max;
-        memcpy(dst, src, copy_len);
-        *dst_len = copy_len;
-        return CELL_OK;
-    }
-
-    /* ASCII -> UTF-8 (identity for 7-bit) */
-    if (src_encoding == L10N_ASCII && dst_encoding == L10N_UTF8) {
-        u32 copy_len = src_len < dst_max ? src_len : dst_max;
-        memcpy(dst, src, copy_len);
-        *dst_len = copy_len;
-        return CELL_OK;
-    }
-
-    /* ISO-8859-1 -> UTF-8 */
-    if (src_encoding == L10N_ISO_8859_1 && dst_encoding == L10N_UTF8) {
-        const u8* s = (const u8*)src;
-        u8* d = (u8*)dst;
-        u32 out_pos = 0;
-        for (u32 i = 0; i < src_len; i++) {
-            int w = encode_utf8(s[i], d + out_pos, dst_max - out_pos);
-            if (w == 0)
-                return (s32)CELL_L10N_ERROR_INSUFFICIENT;
-            out_pos += w;
+    const u8* input = (const u8*)src;
+    u8* output = (u8*)dst;
+    for (u32 pos = 0; pos < src_len;) {
+        u32 cp = 0;
+        u32 consumed = 0;
+        const u32 remaining = src_len - pos;
+        switch (src_encoding) {
+        case L10N_UTF8:
+            consumed = (u32)decode_utf8(input + pos, remaining, &cp);
+            break;
+        case L10N_UTF16: {
+            u16 units[2] = {0, 0};
+            const u32 count = remaining >= 4 ? 2u : remaining / 2u;
+            memcpy(units, input + pos, count * 2u);
+            consumed = (u32)decode_utf16(units, count, &cp) * 2u;
+            break;
         }
-        *dst_len = out_pos;
-        return CELL_OK;
-    }
+        case L10N_UCS2:
+            if (remaining >= 2) {
+                u16 unit; memcpy(&unit, input + pos, 2);
+                cp = unit; consumed = 2;
+            }
+            break;
+        case L10N_UTF32:
+            if (remaining >= 4) { memcpy(&cp, input + pos, 4); consumed = 4; }
+            break;
+        default:
+            cp = input[pos];
+            consumed = src_encoding != L10N_ASCII || cp < 128 ? 1u : 0u;
+            break;
+        }
+        if (!consumed || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+            return (s32)CELL_L10N_ERROR_ILLEGAL_SEQUENCE;
 
-    /* ISO-8859-1 -> UTF-16 */
-    if (src_encoding == L10N_ISO_8859_1 && dst_encoding == L10N_UTF16) {
-        const u8* s = (const u8*)src;
-        u16* d = (u16*)dst;
-        u32 max_units = dst_max / sizeof(u16);
-        u32 count = src_len < max_units ? src_len : max_units;
-        for (u32 i = 0; i < count; i++)
-            d[i] = s[i]; /* ISO-8859-1 codepoints = Unicode codepoints */
-        *dst_len = count * sizeof(u16);
-        return CELL_OK;
+        union { u8 bytes[4]; u16 units[2]; u32 word; } encoded;
+        u32 bytes = 0;
+        switch (dst_encoding) {
+        case L10N_UTF8: bytes = (u32)encode_utf8(cp, encoded.bytes, 4); break;
+        case L10N_UTF16: bytes = (u32)encode_utf16(cp, encoded.units, 2) * 2u; break;
+        case L10N_UTF32: encoded.word = cp; bytes = 4; break;
+        case L10N_UCS2:
+            if (cp < 0x10000) { encoded.units[0] = (u16)cp; bytes = 2; }
+            break;
+        default:
+            if (cp < (dst_encoding == L10N_ASCII ? 128u : 256u)) {
+                encoded.bytes[0] = (u8)cp; bytes = 1;
+            }
+            break;
+        }
+        if (!bytes) return (s32)CELL_L10N_ERROR_ILLEGAL_SEQUENCE;
+        if (bytes > dst_max - *dst_len)
+            return (s32)CELL_L10N_ERROR_INSUFFICIENT;
+        memcpy(output + *dst_len, encoded.bytes, bytes);
+        *dst_len += bytes;
+        pos += consumed;
     }
-
-    printf("[cellL10n] convert: unsupported %u -> %u\n",
-           src_encoding, dst_encoding);
-    return (s32)CELL_L10N_ERROR_NOT_SUPPORTED;
+    return CELL_OK;
 }
 
 s32 l10n_convert_str(s32 src_code, const void* src, u32* src_len,

@@ -84,8 +84,19 @@ static inline int32_t vm_init(void)
      * Reserve a contiguous 4 GB region.  We only commit pages as needed.
      * MEM_RESERVE just reserves address space without backing pages.
      */
+    /* Opt-in texture-cache experiment. Failure retains ordinary VM behavior;
+     * the renderer then detects unavailable tracking and compares every byte. */
+    char texture_watch_mode[8] = {0};
+    DWORD reserve_flags = MEM_RESERVE;
+    if (GetEnvironmentVariableA("TJ_TEXTURE_WRITE_WATCH", texture_watch_mode,
+                                sizeof(texture_watch_mode)) == 1 &&
+        (texture_watch_mode[0] == '1' || texture_watch_mode[0] == '2'))
+        reserve_flags |= MEM_WRITE_WATCH;
     vm_base = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)VM_TOTAL_SIZE,
-                                      MEM_RESERVE, PAGE_NOACCESS);
+                                      reserve_flags, PAGE_NOACCESS);
+    if (!vm_base && (reserve_flags & MEM_WRITE_WATCH))
+        vm_base = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)VM_TOTAL_SIZE,
+                                          MEM_RESERVE, PAGE_NOACCESS);
     if (!vm_base) return CELL_ENOMEM;
 
     /* Commit main memory region (256 MB, read/write) */
@@ -223,19 +234,22 @@ static inline void vm_stack_alloc_init(vm_stack_alloc* sa)
  */
 static inline uint32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size)
 {
+    if (!sa || !stack_size || stack_size > UINT32_MAX - (VM_PAGE_SIZE - 1u) ||
+        sa->next_addr > sa->region_end || (sa->next_addr & (VM_PAGE_SIZE - 1u)))
+        return 0;
     stack_size = VM_ALIGN_UP(stack_size, VM_PAGE_SIZE);
 
-    /* Add a guard page */
-    uint32_t total = stack_size + VM_PAGE_SIZE;
+    /* Include the guard without wrapping large guest requests into a small
+     * allocation. A failed guard must not publish or consume this range. */
+    uint64_t total = (uint64_t)stack_size + VM_PAGE_SIZE;
 
-    if (sa->next_addr + total > sa->region_end)
+    if (total > (uint64_t)sa->region_end - sa->next_addr)
         return 0; /* out of stack space */
 
     uint32_t base = sa->next_addr;
-    sa->next_addr += total;
-
-    /* Guard page at the bottom (no access) */
-    vm_protect(base, VM_PAGE_SIZE, 0, 0, 0);
+    if (vm_protect(base, VM_PAGE_SIZE, 0, 0, 0) != CELL_OK)
+        return 0;
+    sa->next_addr += (uint32_t)total;
 
     return base + VM_PAGE_SIZE; /* skip the guard page */
 }

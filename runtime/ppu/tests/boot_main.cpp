@@ -161,7 +161,8 @@ extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint6
                                    uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" void cellGcmTickVBlank(void);
 extern "C" void cellGcmTickFlip(void);
-extern "C" int  cellGcm_take_flip_pending(void);  /* hoisted to file scope: clang-cl rejects block-scope extern "C" */
+struct gcm_flip_ticket { uint64_t generation; uint32_t buffer_id; };
+extern "C" int cellGcm_take_flip_ticket(gcm_flip_ticket* out_ticket);
 
 static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
                                  uint64_t a2, uint64_t a3, uint64_t a4,
@@ -173,7 +174,8 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
  * thread so the D3D12 device + window message pump live on one thread. */
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
-extern "C" int cellGcm_take_flip_pending(void);
+extern "C" void rsx_d3d12_backend_present_buffer(uint64_t generation,
+                                                   uint32_t buffer_id);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
 extern "C" unsigned cellGcm_flip_request_count(void);
@@ -235,7 +237,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
     if (!_title || !*_title) _title = "You Don't Know Jack (ps3recomp)";
     int rsx_ok = (rsx_d3d12_backend_init(1280, 720, _title) == 0);
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
-    unsigned last_flip = 0;
+    uint64_t last_flip = 0;
     /* The game's frame pacing (vblank/flip handlers -> display frame counter) must
      * advance at ~60Hz regardless of how long present() blocks. On a hidden/occluded
      * window DXGI Present throttles hard, which previously stalled these ticks and
@@ -255,9 +257,11 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * flip-count change after the drain raced the guest's next-frame
              * writes and showed empty or mixed batches. */
             {
-                if (rsx_ok && cellGcm_take_flip_pending()) {
-                    rsx_d3d12_backend_present();
-                    last_flip = cellGcm_flip_request_count();
+                gcm_flip_ticket ticket = {};
+                if (rsx_ok && cellGcm_take_flip_ticket(&ticket)) {
+                    rsx_d3d12_backend_present_buffer(ticket.generation,
+                                                      ticket.buffer_id);
+                    last_flip = ticket.generation;
                 }
             }
             /* Drain the game's GCM FIFO every tick -- this writes the RSX sync-fence
@@ -274,9 +278,11 @@ static DWORD WINAPI vblank_ticker(LPVOID)
          * at 16ms per fence wave's six passes paced the guest to ~7 fps.
          * The real RSX writes those fences in microseconds. */
         if (rsx_ok) {
-            if (cellGcm_take_flip_pending()) {
-                rsx_d3d12_backend_present();
-                last_flip = cellGcm_flip_request_count();
+            gcm_flip_ticket ticket = {};
+            if (cellGcm_take_flip_ticket(&ticket)) {
+                rsx_d3d12_backend_present_buffer(ticket.generation,
+                                                  ticket.buffer_id);
+                last_flip = ticket.generation;
             }
             cellGcm_rsx_process_fifo();
         }

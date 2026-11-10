@@ -6,14 +6,18 @@
  */
 
 #include "sceNp.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 -- out-params are guest EAs */
 #include <stdio.h>
 #include <string.h>
+
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
 /* ---------------------------------------------------------------------------
  * Internal state
  * -----------------------------------------------------------------------*/
 
 static int  s_np_initialized = 0;
+static int  s_np_score_initialized = 0;
 static char s_fake_username[SCE_NP_ONLINEID_MAX_LENGTH + 1] = "PS3Player";
 
 /* ---------------------------------------------------------------------------
@@ -62,7 +66,67 @@ s32 sceNpTerm(void)
     if (!s_np_initialized)
         return SCE_NP_ERROR_NOT_INITIALIZED;
 
+    s_np_score_initialized = 0;
     s_np_initialized = 0;
+    return CELL_OK;
+}
+
+s32 sceNpScoreInit(void)
+{
+    printf("[sceNp] ScoreInit()\n");
+
+    if (s_np_score_initialized)
+        return SCE_NP_COMMUNITY_ERROR_ALREADY_INITIALIZED;
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+
+    s_np_score_initialized = 1;
+    return CELL_OK;
+}
+
+s32 sceNpScoreTerm(void)
+{
+    printf("[sceNp] ScoreTerm()\n");
+
+    if (!s_np_score_initialized)
+        return SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+
+    s_np_score_initialized = 0;
+    return CELL_OK;
+}
+
+s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path)
+{
+    uint32_t key_ea = (uint32_t)(uintptr_t)k_licensee;
+    uint32_t path_ea = (uint32_t)(uintptr_t)drm_path;
+    if (!key_ea || !path_ea)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+
+    uint8_t key[16];
+    char path[256];
+    for (uint32_t i = 0; i < sizeof key; i++) key[i] = vm_read8(key_ea + i);
+    uint32_t i = 0;
+    for (; i + 1 < sizeof path; i++) {
+        path[i] = (char)vm_read8(path_ea + i);
+        if (!path[i]) break;
+    }
+    path[sizeof path - 1] = '\0';
+
+    /* Hardware checks that the NPDRM target exists before accepting its
+     * license.  Returning CELL_OK for Tokyo Jungle's absent DLC made it spawn
+     * and join an NPDRM-open thread for every DLC slot, stretching a simple
+     * no-DLC scan into several minutes of blank frames. */
+    extern int ppu_fs_guest_exists(const char* guest_path);
+    if (!ppu_fs_guest_exists(path)) {
+        printf("[sceNp] DrmIsAvailable(path='%s') -> CELL_ENOENT\n", path);
+        return (s32)CELL_ENOENT;
+    }
+
+    extern void ppu_fs_set_npdrm_key(const uint8_t key[16]);
+    ppu_fs_set_npdrm_key(key);
+    printf("[sceNp] DrmIsAvailable(path='%s') -> licensed\n", path);
     return CELL_OK;
 }
 
@@ -76,6 +140,7 @@ s32 sceNpGetNpId(s32 userId, SceNpId* npId)
     if (!npId)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
+    npId = GUEST_PTR(npId, SceNpId*);
     np_build_fake_id(npId);
     printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, s_fake_username);
     return CELL_OK;
@@ -91,6 +156,7 @@ s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId)
     if (!onlineId)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
+    onlineId = GUEST_PTR(onlineId, SceNpOnlineId*);
     memset(onlineId, 0, sizeof(SceNpOnlineId));
     strncpy(onlineId->data, s_fake_username, SCE_NP_ONLINEID_MAX_LENGTH);
     onlineId->term = '\0';
@@ -109,6 +175,7 @@ s32 sceNpGetOnlineName(s32 userId, SceNpOnlineName* onlineName)
     if (!onlineName)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
+    onlineName = GUEST_PTR(onlineName, SceNpOnlineName*);
     memset(onlineName, 0, sizeof(SceNpOnlineName));
     strncpy(onlineName->data, s_fake_username,
             SCE_NP_ONLINENAME_MAX_LENGTH - 1);
@@ -128,6 +195,7 @@ s32 sceNpGetUserProfile(s32 userId, SceNpUserInfo* userInfo)
     if (!userInfo)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
+    userInfo = GUEST_PTR(userInfo, SceNpUserInfo*);
     memset(userInfo, 0, sizeof(SceNpUserInfo));
     np_build_fake_id(&userInfo->npId);
     strncpy(userInfo->onlineName.data, s_fake_username,
@@ -150,7 +218,7 @@ s32 sceNpGetAccountRegion(s32 userId, u32* region)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     /* Region: US (SCEA) = 0x5553 ('US') */
-    *region = 0x5553;
+    vm_write32((uint32_t)(uintptr_t)region, 0x5553);
 
     printf("[sceNp] GetAccountRegion(user=%d) -> US\n", userId);
     return CELL_OK;
@@ -166,8 +234,8 @@ s32 sceNpGetAccountAge(s32 userId, s32* age)
     if (!age)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
-    *age = 25; /* default adult age */
-    printf("[sceNp] GetAccountAge(user=%d) -> %d\n", userId, *age);
+    vm_write32((uint32_t)(uintptr_t)age, 25); /* default adult age */
+    printf("[sceNp] GetAccountAge(user=%d) -> 25\n", userId);
     return CELL_OK;
 }
 
@@ -179,9 +247,10 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs)
     if (!langs)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
-    langs->language1 = SCE_NP_LANG_ENGLISH;
-    langs->language2 = 0;
-    langs->language3 = 0;
+    uint32_t langs_ea = (uint32_t)(uintptr_t)langs;
+    vm_write32(langs_ea + 0, SCE_NP_LANG_ENGLISH);
+    vm_write32(langs_ea + 4, 0);
+    vm_write32(langs_ea + 8, 0);
 
     printf("[sceNp] GetMyLanguages() -> English\n");
     return CELL_OK;
@@ -206,7 +275,7 @@ s32 sceNpManagerGetStatus(s32* status)
         return SCE_NP_ERROR_NOT_INITIALIZED;
     if (!status)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
-    *status = SCE_NP_MANAGER_STATUS_OFFLINE;   /* -1, endian-safe */
+    vm_write32((uint32_t)(uintptr_t)status, SCE_NP_MANAGER_STATUS_OFFLINE);
     printf("[sceNp] ManagerGetStatus() -> OFFLINE\n");
     return CELL_OK;
 }

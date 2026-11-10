@@ -29,6 +29,8 @@ extern "C" {
 #define SCE_NP_ERROR_ABORTED                    0x8002aa0b
 #define SCE_NP_ERROR_OFFLINE                    0x8002aa0c
 #define SCE_NP_ERROR_INTERNAL                   0x8002aaff
+#define SCE_NP_COMMUNITY_ERROR_ALREADY_INITIALIZED 0x8002a101
+#define SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED     0x8002a102
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -101,6 +103,9 @@ typedef struct SceNpMyLanguages {
 
 s32 sceNpInit(u32 poolSize, void* poolPtr);
 s32 sceNpTerm(void);
+s32 sceNpScoreInit(void);
+s32 sceNpScoreTerm(void);
+s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path);
 
 s32 sceNpGetNpId(s32 userId, SceNpId* npId);
 s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId);

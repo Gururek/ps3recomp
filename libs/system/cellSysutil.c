@@ -6,6 +6,7 @@
  */
 
 #include "cellSysutil.h"
+#include "cellMsgDialog.h"
 #include "ps3emu/guest_call.h"
 #include <stdio.h>
 #include <string.h>
@@ -154,6 +155,8 @@ s32 cellSysutilCheckCallback(void)
                                0, 0, 0, 0, 0);
         }
     }
+
+    cellMsgDialogDispatchPending();
     return CELL_OK;
 }
 

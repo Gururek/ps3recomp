@@ -67,6 +67,7 @@ static const char* sysmodule_id_to_name(u16 id)
     case CELL_SYSMODULE_SYSUTIL_NP2:   return "CELL_SYSMODULE_SYSUTIL_NP2";
     case CELL_SYSMODULE_SYSUTIL_GAME_EXEC: return "CELL_SYSMODULE_SYSUTIL_GAME_EXEC";
     case CELL_SYSMODULE_SYSUTIL_NP_TROPHY: return "CELL_SYSMODULE_SYSUTIL_NP_TROPHY";
+    case CELL_SYSMODULE_SYSUTIL_NP_EULA: return "CELL_SYSMODULE_SYSUTIL_NP_EULA";
     case CELL_SYSMODULE_MIC:           return "CELL_SYSMODULE_MIC";
     case CELL_SYSMODULE_FONTFT:        return "CELL_SYSMODULE_FONTFT";
     case CELL_SYSMODULE_AVCONF_EXT:    return "CELL_SYSMODULE_AVCONF_EXT";
@@ -100,6 +101,14 @@ s32 cellSysmoduleLoadModule(u16 id)
     return CELL_OK;
 }
 
+/* NID: 0x1A267F98 -- extended 0xF0xx module loader. */
+s32 cellSysmoduleLoadModuleEx(u16 id)
+{
+    if ((id & 0xFF00) != 0xF000)
+        return CELL_SYSMODULE_ERROR_UNKNOWN;
+    return cellSysmoduleLoadModule(id);
+}
+
 /* NID: 0x112A5EE9 */
 s32 cellSysmoduleUnloadModule(u16 id)
 {
@@ -115,6 +124,14 @@ s32 cellSysmoduleUnloadModule(u16 id)
 
     s_module_loaded[slot] = 0;
     return CELL_OK;
+}
+
+/* NID: 0xFD0E1CAC -- extended 0xF0xx module unloader. */
+s32 cellSysmoduleUnloadModuleEx(u16 id)
+{
+    if ((id & 0xFF00) != 0xF000)
+        return CELL_SYSMODULE_ERROR_UNKNOWN;
+    return cellSysmoduleUnloadModule(id);
 }
 
 /* NID: 0x5A59E258 */

@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ppu_thread_exit_signal.h"
 #ifdef _WIN32
 #include <windows.h>        /* CRITICAL_SECTION for real lwmutex exclusion */
 #endif
@@ -26,6 +27,9 @@ extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" uint64_t vm_read64(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
+extern "C" uint64_t ppu_guest_call(uint32_t opd,
+                                     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                     uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
 
 /* Simple bump allocator for TLS areas, in a free vm region below the stack. */
 static uint32_t s_tls_next = 0x0E000000u;
@@ -79,6 +83,33 @@ static void sys_process_is_stack(ppu_context* ctx)
 {
     uint32_t a = (uint32_t)ctx->gpr[3];
     ctx->gpr[3] = (a >= 0x0E000000u && a < 0x10000000u) ? 1 : 0;
+}
+
+/* sys_ppu_thread_once(sys_ppu_thread_once_t* control, void (*init)(void)).
+ * The callback is an ELFv1 function descriptor (OPD), not a raw code address.
+ * Mark the control before entering guest code so a recursive call using the
+ * same control cannot re-enter the initializer. The common title path is
+ * serialized by its surrounding CRT lock; ppu_guest_call supplies an isolated
+ * callback stack while sharing the guest VM where the initializer publishes
+ * its globals. */
+static void sys_ppu_thread_once(ppu_context* ctx)
+{
+    uint32_t control = (uint32_t)ctx->gpr[3];
+    uint32_t init_opd = (uint32_t)ctx->gpr[4];
+
+    if (!control || !init_opd) {
+        ctx->gpr[3] = (uint64_t)(uint32_t)0x80010002u; /* CELL_EINVAL */
+        return;
+    }
+
+    if (vm_read32(control) == 0) {
+        vm_write32(control, 1);
+        fprintf(stderr, "[crt] sys_ppu_thread_once: control=0x%08X init=0x%08X\n",
+                control, init_opd);
+        ppu_guest_call(init_opd, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+
+    ctx->gpr[3] = 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -465,7 +496,11 @@ extern "C" int64_t sys_ppu_thread_exit(ppu_context* ctx);
  * sub_52613C does `v6 = (ret==0); return v6 ? tid : 0`, so a nonzero ret makes it
  * hand back 0 and the caller's init (sub_C1484 / KdConvert) bails. */
 static void hle_ppu_thread_create(ppu_context* ctx) { ctx->gpr[3] = sys_ppu_thread_create(ctx); }
-static void hle_ppu_thread_exit(ppu_context* ctx)   { ctx->gpr[3] = sys_ppu_thread_exit(ctx); }
+static void hle_ppu_thread_exit(ppu_context* ctx)
+{
+    sys_ppu_thread_exit(ctx);
+    ppu_throw_thread_exit();
+}
 
 /* _cellGcmInitBody (NID 0x15BAE46B) -- the GCM init every PS3 game calls via the
  * cellGcmInit() SDK macro. cellGcmSys.c provides the layout-correct core
@@ -494,15 +529,15 @@ static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(
 /* FIFO command-buffer-full callback. cellGcmSetupContext points the guest
  * context's callback OPD at GCM_FIFO_CALLBACK_SENTINEL_EA; the title's inline
  * gcmReserve calls context->callback(context, count) on ring wrap, which the
- * indirect dispatcher routes here. r3 = guest context EA. Must match the sentinel
- * define in libs/video/cellGcmSys.c. */
+ * indirect dispatcher routes here. r3 = guest context EA, r4 = requested words.
+ * Must match the sentinel define in libs/video/cellGcmSys.c. */
 #define GCM_FIFO_CALLBACK_SENTINEL_EA 0x03002F00u
-extern "C" void cellGcm_fifo_recycle(unsigned int ctx_ea);
+extern "C" int cellGcm_fifo_recycle_n(unsigned int ctx_ea, unsigned int count);
 extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
 static void hle_gcm_callback(ppu_context* ctx)
 {
-    cellGcm_fifo_recycle((unsigned int)ctx->gpr[3]);   /* r3 = context EA */
-    ctx->gpr[3] = 0;                                   /* CELL_OK */
+    ctx->gpr[3] = (int64_t)cellGcm_fifo_recycle_n((unsigned int)ctx->gpr[3],
+                                                  (unsigned int)ctx->gpr[4]);
 }
 
 static void hle_cellGcmInitBody(ppu_context* ctx)
@@ -625,6 +660,7 @@ extern "C" void ppu_sysprx_register(void)
      * means map/unmap/free are no-ops: the memory already exists everywhere. */
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_get_id"),      "sys_ppu_thread_get_id",      sys_ppu_thread_get_id);
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_create"),      "sys_ppu_thread_create",      hle_ppu_thread_create);
+    ps3_hle_register_ctx(0xA3E3BE68u,                                   "sys_ppu_thread_once",        sys_ppu_thread_once);
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_exit"),        "sys_ppu_thread_exit",        hle_ppu_thread_exit);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory"), "sys_mmapper_allocate_memory", sys_mmapper_allocate_memory);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory_from_container"), "sys_mmapper_allocate_memory_from_container", sys_mmapper_allocate_memory_from_container);

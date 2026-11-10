@@ -127,7 +127,12 @@ int64_t sys_fs_mkdir(ppu_context* ctx);
 int64_t sys_fs_rename(ppu_context* ctx);
 int64_t sys_fs_unlink(ppu_context* ctx);
 int64_t sys_fs_rmdir(ppu_context* ctx);
+int64_t sys_fs_link(ppu_context* ctx);
+int64_t sys_fs_utime(ppu_context* ctx);
+int64_t sys_fs_fsync(ppu_context* ctx);
+int64_t sys_fs_truncate(ppu_context* ctx);
 int64_t sys_fs_ftruncate(ppu_context* ctx);
+int64_t sys_fs_chmod(ppu_context* ctx);
 
 /* Registration */
 void sys_fs_init(lv2_syscall_table* tbl);

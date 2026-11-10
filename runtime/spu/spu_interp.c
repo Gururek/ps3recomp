@@ -68,7 +68,9 @@ static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
     if (op11 == 0x00F) { d->op = SPU_rchcnt; return; }
     /* RI10 (8) */
     if ((d->op = spu_dec_ri10(op8)) != SPU_word) {
-        d->imm = (d->op == SPU_lqd || d->op == SPU_stqd) ? (i10 << 4) : i10;
+        /* Multiplication avoids left-shifting a negative signed value (undefined
+         * in C) while preserving the RI10 quadword displacement. */
+        d->imm = (d->op == SPU_lqd || d->op == SPU_stqd) ? (i10 * 16) : i10;
         return;
     }
     /* RI8 (10) float<->int conversions */
@@ -76,6 +78,7 @@ static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
     /* RR (11) */
     if ((d->op = spu_dec_rr(op11)) != SPU_word) {
         if (d->op == SPU_stop) d->imm = insn & 0x3FFF;
+        else if (d->op == SPU_dftsv) d->imm = (int32_t)d->rb;
         return;
     }
     /* RI7 (11) rotate/shift/gen-control immediates */
@@ -100,7 +103,8 @@ static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
 #define I   (d.imm)
 #define PREF(r) ((r)._u32[0])
 
-static int spu_step(spu_context* ctx) {
+int spu_interp_step(spu_context* ctx, int* branch_taken) {
+    if (branch_taken) *branch_taken = 0;
     uint32_t pc = ctx->pc, m = pc & SPU_LS_MASK;
     const uint8_t* p = ctx->ls;
     uint32_t insn = ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
@@ -110,8 +114,9 @@ static int spu_step(spu_context* ctx) {
 
     switch (d.op) {
     /* immediates / loads */
-    case SPU_il: case SPU_ilh: DST = spu_splat_u32((uint32_t)(int32_t)I); break;
-    case SPU_ilhu: DST = spu_splat_u32((uint32_t)I << 16); break;
+    case SPU_il:   DST = spu_il(I); break;
+    case SPU_ilh:  DST = spu_ilh((uint16_t)I); break;
+    case SPU_ilhu: DST = spu_ilhu((uint16_t)I); break;
     case SPU_ila:  DST = spu_splat_u32((uint32_t)I & 0x3FFFF); break;
     case SPU_iohl: DST = spu_ori(DST, (int32_t)((uint32_t)I & 0xFFFF)); break;
     case SPU_fsmbi: DST = spu_fsmbi(I); break;
@@ -136,7 +141,9 @@ static int spu_step(spu_context* ctx) {
     case SPU_sfx:  DST = spu_sfx(A,B,DST); break;
     case SPU_cg:   DST = spu_cg(A,B); break;
     case SPU_cgx:  DST = spu_cgx(A,B,DST); break;
+    case SPU_bgx:  DST = spu_bgx(A,B,DST); break;
     case SPU_mpyi: DST = spu_mpyi(A,I); break;
+    case SPU_mpyui:DST = spu_mpyui(A,I); break;
     /* logical */
     case SPU_and: DST = spu_and(A,B); break;
     case SPU_or:  DST = spu_or(A,B); break;
@@ -151,7 +158,10 @@ static int spu_step(spu_context* ctx) {
     case SPU_xori:DST = spu_xori(A,I); break;
     case SPU_andbi:DST = spu_andbi(A,I); break;
     case SPU_andhi:DST = spu_andhi(A,I); break;
+    case SPU_orbi: DST = spu_orbi(A,I); break;
     case SPU_orhi: DST = spu_orhi(A,I); break;
+    case SPU_xorbi:DST = spu_xorbi(A,I); break;
+    case SPU_xorhi:DST = spu_xorhi(A,I); break;
     case SPU_orx:  DST = spu_orx(A); break;
     /* compares */
     case SPU_ceq: DST = spu_ceq(A,B); break;
@@ -179,12 +189,16 @@ static int spu_step(spu_context* ctx) {
     case SPU_rotmai:DST = spu_rotmai(A,I); break;
     case SPU_roth: DST = spu_roth(A,B); break;
     case SPU_rothi:DST = spu_rothi(A,I); break;
+    case SPU_rothmi:DST = spu_rothmi(A,I); break;
+    case SPU_rotmah:DST = spu_rothma(A,B); break;
+    case SPU_rotmahi:DST = spu_rotmahi(A,I); break;
     case SPU_shlqbi: DST = spu_shlqbi(A,B); break;
     case SPU_shlqbii:DST = spu_shlqbii(A,I); break;
     case SPU_shlqby: DST = spu_shlqby(A,B); break;
     case SPU_shlqbyi:DST = spu_shlqbyi(A,I); break;
     case SPU_rotqbi: DST = spu_rotqbi(A,B); break;
     case SPU_rotqbii:DST = spu_rotqbii(A,I); break;
+    case SPU_rotqmbii:DST = spu_rotqmbii(A,I); break;
     case SPU_rotqby: DST = spu_rotqby(A,B); break;
     case SPU_rotqbyi:DST = spu_rotqbyi(A,I); break;
     case SPU_rotqmby: DST = spu_rotqmby(A,B); break;
@@ -214,6 +228,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_mpyu: DST = spu_mpyu(A,B); break;
     case SPU_mpyh: DST = spu_mpyh(A,B); break;
     case SPU_mpya: DSTC = spu_mpya(A,B,T); break;
+    case SPU_mpyhhau:DST = spu_mpyhhau(A,B,DST); break;
     /* sign-extend */
     case SPU_xsbh: DST = spu_xsbh(A); break;
     case SPU_xshw: DST = spu_xshw(A); break;
@@ -224,6 +239,14 @@ static int spu_step(spu_context* ctx) {
     case SPU_fm: DST = spu_fm(A,B); break;
     case SPU_fcgt: DST = spu_fcgt(A,B); break;
     case SPU_fceq: DST = spu_fceq(A,B); break;
+    case SPU_dfa: DST = spu_dfa(A,B); break;
+    case SPU_dfs: DST = spu_dfs(A,B); break;
+    case SPU_dfm: DST = spu_dfm(A,B); break;
+    case SPU_dfceq: DST = spu_dfceq(A,B); break;
+    case SPU_dfcgt: DST = spu_dfcgt(A,B); break;
+    case SPU_dfcmeq: DST = spu_dfcmeq(A,B); break;
+    case SPU_dfcmgt: DST = spu_dfcmgt(A,B); break;
+    case SPU_dftsv: DST = spu_dftsv(A,I); break;
     case SPU_cflts: DST = spu_cflts(A,I); break;
     case SPU_cfltu: DST = spu_cfltu(A,I); break;
     case SPU_csflt: DST = spu_csflt(A,I); break;
@@ -238,6 +261,10 @@ static int spu_step(spu_context* ctx) {
     case SPU_fma:  DSTC = spu_fma(A,B,T); break;    /* RRR: dest=rc */
     case SPU_fms:  DSTC = spu_fms(A,B,T); break;
     case SPU_fnms: DSTC = spu_fnms(A,B,T); break;
+    case SPU_dfma:  DST = spu_dfma(A,B,DST); break;
+    case SPU_dfms:  DST = spu_dfms(A,B,DST); break;
+    case SPU_dfnms: DST = spu_dfnms(A,B,DST); break;
+    case SPU_dfnma: DST = spu_dfnma(A,B,DST); break;
     /* immediate byte/halfword compares */
     case SPU_ceqbi: DST = spu_ceqbi(A,I); break;
     case SPU_cgtbi: DST = spu_cgtbi(A,I); break;
@@ -253,7 +280,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_mpys:  DST = spu_mpys(A,B); break;
     case SPU_mpyhh: DST = spu_mpyhh(A,B); break;
     case SPU_mpyhhu:DST = spu_mpyhhu(A,B); break;
-    case SPU_mpyhha:DSTC = spu_mpyhha(A,B,T); break;  /* RRR */
+    case SPU_mpyhha:DST = spu_mpyhha(A,B,DST); break;
     /* rotate / shift extras */
     case SPU_rothm:    DST = spu_rothm(A,B); break;
     case SPU_rotqmbi:  DST = spu_rotqmbi(A,B); break;
@@ -263,26 +290,83 @@ static int spu_step(spu_context* ctx) {
     /* channels */
     case SPU_wrch: spu_wrch(ctx, d.ch, DST); break;
     case SPU_rdch: DST = spu_rdch(ctx, d.ch); break;
-    case SPU_rchcnt: DST = spu_splat_u32(spu_rchcnt(ctx, d.ch)); break;
+    case SPU_rchcnt: DST = spu_pref_u32(spu_rchcnt(ctx, d.ch)); break;
     /* hints / no-ops */
     case SPU_nop: case SPU_lnop: case SPU_sync: case SPU_dsync:
     case SPU_hbr: case SPU_hbra: case SPU_hbrr: case SPU_mtspr:
-    case SPU_mfspr: case SPU_fscrrd: case SPU_fscrwr: break;
+    case SPU_fscrwr: break;
+    case SPU_mfspr:  DST = spu_mfspr(A); break;
+    case SPU_fscrrd: DST = spu_fscrrd(A); break;
     /* control flow */
-    case SPU_br: case SPU_bra: next = d.tgt; break;
-    case SPU_brsl: case SPU_brasl: DST = spu_link(pc + 4); next = d.tgt;
+    case SPU_br: case SPU_bra:
+        if (branch_taken) *branch_taken = 1;
+        next = d.tgt; break;
+    case SPU_brsl: case SPU_brasl:
+        DST = spu_link(pc + 4);
+        if (branch_taken) *branch_taken = 1;
+        next = d.tgt;
         { extern void spu_trace_call(uint32_t,uint32_t); spu_trace_call(pc, d.tgt); } break;
-    case SPU_brz:  if (PREF(DST) == 0) next = d.tgt; break;
-    case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
-    case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
-    case SPU_brhnz:if ((PREF(DST) & 0xFFFF) != 0) next = d.tgt; break;
-    case SPU_bi:   next = PREF(A) & 0x3FFFC; break;
-    case SPU_bisl: DST = spu_link(pc + 4); next = PREF(A) & 0x3FFFC; break;
-    case SPU_iret: next = ctx->srr0 & 0x3FFFC; break;
-    case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_binz: if (PREF(DST) != 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) next = PREF(A) & 0x3FFFC; break;
+    case SPU_brz:  if (PREF(DST) == 0) { if (branch_taken) *branch_taken = 1; next = d.tgt; } break;
+    case SPU_brnz: if (PREF(DST) != 0) { if (branch_taken) *branch_taken = 1; next = d.tgt; } break;
+    case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) { if (branch_taken) *branch_taken = 1; next = d.tgt; } break;
+    case SPU_brhnz:if ((PREF(DST) & 0xFFFF) != 0) { if (branch_taken) *branch_taken = 1; next = d.tgt; } break;
+    case SPU_bi:
+        if (insn & 0x40000u) ctx->int_enable = 1;
+        else if (insn & 0x80000u) ctx->int_enable = 0;
+        if (branch_taken) *branch_taken = 1;
+        next = PREF(A) & 0x3FFFC; break;
+    case SPU_bisl:
+        DST = spu_link(pc + 4);
+        if (insn & 0x40000u) ctx->int_enable = 1;
+        else if (insn & 0x80000u) ctx->int_enable = 0;
+        if (branch_taken) *branch_taken = 1;
+        next = PREF(A) & 0x3FFFC; break;
+    case SPU_bisled:
+        DST = spu_link(pc + 4);
+        if (ctx->event_status & ctx->event_mask) {
+            if (insn & 0x40000u) ctx->int_enable = 1;
+            else if (insn & 0x80000u) ctx->int_enable = 0;
+            if (branch_taken) *branch_taken = 1;
+            next = PREF(A) & 0x3FFFC;
+        }
+        break;
+    case SPU_iret:
+        if (insn & 0x40000u) ctx->int_enable = 1;
+        else if (insn & 0x80000u) ctx->int_enable = 0;
+        if (branch_taken) *branch_taken = 1;
+        next = ctx->srr0 & 0x3FFFC; break;
+    case SPU_biz:
+        if (PREF(DST) == 0) {
+            if (insn & 0x40000u) ctx->int_enable = 1;
+            else if (insn & 0x80000u) ctx->int_enable = 0;
+            if (branch_taken) *branch_taken = 1;
+            next = PREF(A) & 0x3FFFC;
+        }
+        break;
+    case SPU_binz:
+        if (PREF(DST) != 0) {
+            if (insn & 0x40000u) ctx->int_enable = 1;
+            else if (insn & 0x80000u) ctx->int_enable = 0;
+            if (branch_taken) *branch_taken = 1;
+            next = PREF(A) & 0x3FFFC;
+        }
+        break;
+    case SPU_bihz:
+        if ((PREF(DST) & 0xFFFF) == 0) {
+            if (insn & 0x40000u) ctx->int_enable = 1;
+            else if (insn & 0x80000u) ctx->int_enable = 0;
+            if (branch_taken) *branch_taken = 1;
+            next = PREF(A) & 0x3FFFC;
+        }
+        break;
+    case SPU_bihnz:
+        if ((PREF(DST) & 0xFFFF) != 0) {
+            if (insn & 0x40000u) ctx->int_enable = 1;
+            else if (insn & 0x80000u) ctx->int_enable = 0;
+            if (branch_taken) *branch_taken = 1;
+            next = PREF(A) & 0x3FFFC;
+        }
+        break;
     case SPU_stop: case SPU_stopd:
         ctx->pc = next; ctx->stop_code = (uint32_t)I;
         ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;
@@ -382,7 +466,7 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
             #undef LB
             fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
         }
-        if (spu_step(ctx)) { g_spu_interp_steps = steps;
+        if (spu_interp_step(ctx, NULL)) { g_spu_interp_steps = steps;
             if (_tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
                     ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
                 for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);

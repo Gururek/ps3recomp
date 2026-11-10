@@ -14,6 +14,18 @@
  * -----------------------------------------------------------------------*/
 
 static float s_gamma = 1.0f;
+static CellAudioOutConfiguration s_audio_configuration = {
+    CELL_AUDIO_OUT_CHNUM_2, CELL_AUDIO_OUT_CODING_TYPE_LPCM, { 0 }, 0
+};
+
+static s32 audio_out_validate(u32 audioOut)
+{
+    if (audioOut == CELL_AUDIO_OUT_PRIMARY)
+        return CELL_OK;
+    if (audioOut == CELL_AUDIO_OUT_SECONDARY)
+        return (s32)CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT;
+    return (s32)CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER;
+}
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -46,13 +58,19 @@ s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
 
 s32 cellAudioOutGetSoundAvailability2(u32 audioOut, u32 type, u32 fs, u32 ch, u32 option)
 {
-    (void)audioOut;
     (void)option;
 
+    if (audioOut != CELL_AUDIO_OUT_PRIMARY)
+        return 0;
+    if (!(fs & CELL_AUDIO_OUT_FS_48KHZ))
+        return 0;
     if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM &&
-        (fs & CELL_AUDIO_OUT_FS_48KHZ) &&
-        (ch == CELL_AUDIO_OUT_CHNUM_2 || ch == CELL_AUDIO_OUT_CHNUM_6 || ch == CELL_AUDIO_OUT_CHNUM_8))
-        return 1; /* available */
+        (ch == CELL_AUDIO_OUT_CHNUM_2 || ch == CELL_AUDIO_OUT_CHNUM_6 ||
+         ch == CELL_AUDIO_OUT_CHNUM_8))
+        return (s32)ch;
+    if ((type == CELL_AUDIO_OUT_CODING_TYPE_AC3 || type == CELL_AUDIO_OUT_CODING_TYPE_DTS) &&
+        ch == CELL_AUDIO_OUT_CHNUM_6)
+        return (s32)ch;
 
     return 0;
 }
@@ -60,14 +78,16 @@ s32 cellAudioOutGetSoundAvailability2(u32 audioOut, u32 type, u32 fs, u32 ch, u3
 s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
                                CellAudioOutDeviceInfo* info)
 {
-    (void)audioOut;
-    (void)deviceIndex;
-
     printf("[cellAvconfExt] AudioOutGetDeviceInfo(out=%u, dev=%u)\n",
            audioOut, deviceIndex);
 
     if (!info)
-        return CELL_EINVAL;
+        return (s32)CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER;
+    s32 rc = audio_out_validate(audioOut);
+    if (rc != CELL_OK)
+        return rc;
+    if (deviceIndex != 0)
+        return (s32)CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE;
 
     memset(info, 0, sizeof(CellAudioOutDeviceInfo));
 
@@ -77,17 +97,29 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
      * Advertising a single stereo mode here while GetSoundAvailability reports 5.1/7.1 is
      * self-inconsistent, and middleware (FMOD) validates these against each other. */
     info->portType = 0; /* HDMI */
-    info->state = 2;    /* connected */
-    info->availableModeCount = 3;
+    info->state = 1;    /* available */
+    info->latency = 13;
+    info->availableModeCount = 5;
     info->availableModes[0].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
     info->availableModes[0].channel = CELL_AUDIO_OUT_CHNUM_2;
     info->availableModes[0].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+    info->availableModes[0].layout  = CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH;
     info->availableModes[1].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
     info->availableModes[1].channel = CELL_AUDIO_OUT_CHNUM_6;
     info->availableModes[1].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+    info->availableModes[1].layout  = CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr;
     info->availableModes[2].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
     info->availableModes[2].channel = CELL_AUDIO_OUT_CHNUM_8;
     info->availableModes[2].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+    info->availableModes[2].layout  = CELL_AUDIO_OUT_SPEAKER_LAYOUT_8CH_LREClrxy;
+    info->availableModes[3].type    = CELL_AUDIO_OUT_CODING_TYPE_AC3;
+    info->availableModes[3].channel = CELL_AUDIO_OUT_CHNUM_6;
+    info->availableModes[3].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+    info->availableModes[3].layout  = CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr;
+    info->availableModes[4].type    = CELL_AUDIO_OUT_CODING_TYPE_DTS;
+    info->availableModes[4].channel = CELL_AUDIO_OUT_CHNUM_6;
+    info->availableModes[4].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+    info->availableModes[4].layout  = CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr;
 
     return CELL_OK;
 }
@@ -96,18 +128,18 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
                                   CellAudioOutConfiguration* config,
                                   void* option, u32 optionSize)
 {
-    (void)audioOut;
     (void)option;
     (void)optionSize;
 
     printf("[cellAvconfExt] AudioOutGetConfiguration()\n");
 
     if (!config)
-        return CELL_EINVAL;
+        return (s32)CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER;
+    s32 rc = audio_out_validate(audioOut);
+    if (rc != CELL_OK)
+        return rc;
 
-    memset(config, 0, sizeof(CellAudioOutConfiguration));
-    config->channel = CELL_AUDIO_OUT_CHNUM_2;
-    config->encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+    *config = s_audio_configuration;
 
     return CELL_OK;
 }
@@ -121,8 +153,11 @@ s32 cellAudioOutSetCopyControl(u32 audioOut, u32 control)
 
 s32 cellAudioOutGetNumberOfDevice(u32 audioOut)
 {
-    (void)audioOut;
-    return 1; /* one audio output device */
+    if (audioOut == CELL_AUDIO_OUT_PRIMARY)
+        return 1;
+    if (audioOut == CELL_AUDIO_OUT_SECONDARY)
+        return 0;
+    return (s32)CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER;
 }
 
 s32 cellVideoOutGetGamma(u32 videoOut, float* gamma)
@@ -142,11 +177,35 @@ s32 cellVideoOutSetGamma(u32 videoOut, float gamma)
 }
 
 /* cellAudioOutConfigure(audioOut, config, option, waitForEvent) -- set the
- * audio output mode. We accept any config and report success (request id 0);
- * the title queries availability separately. NID 0x4692AB35. */
-s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent)
+ * selected host-visible output mode. NID 0x4692AB35. */
+s32 cellAudioOutConfigure(u32 audioOut, CellAudioOutConfiguration* config,
+                          void* option, u32 waitForEvent)
 {
-    (void)config; (void)option; (void)waitForEvent;
-    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
-    return 0;
+    (void)option;
+    (void)waitForEvent;
+    if (!config)
+        return (s32)CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER;
+    s32 rc = audio_out_validate(audioOut);
+    if (rc != CELL_OK)
+        return rc;
+
+    const int channel_supported = config->channel == CELL_AUDIO_OUT_CHNUM_2 ||
+        config->channel == CELL_AUDIO_OUT_CHNUM_6 ||
+        config->channel == CELL_AUDIO_OUT_CHNUM_8;
+    const int encoder_supported = config->encoder == CELL_AUDIO_OUT_CODING_TYPE_LPCM ||
+        config->encoder == CELL_AUDIO_OUT_CODING_TYPE_AC3 ||
+        config->encoder == CELL_AUDIO_OUT_CODING_TYPE_DTS;
+    const int encoding_combo_supported = config->encoder == CELL_AUDIO_OUT_CODING_TYPE_LPCM ||
+        config->channel == CELL_AUDIO_OUT_CHNUM_6;
+    if (!channel_supported || !encoder_supported || !encoding_combo_supported)
+        return (s32)CELL_AUDIO_OUT_ERROR_UNSUPPORTED_SOUND_MODE;
+
+    s_audio_configuration.channel = config->channel;
+    s_audio_configuration.encoder = config->encoder;
+    if (config->downMixer <= 2)
+        s_audio_configuration.downMixer = config->downMixer;
+    memset(s_audio_configuration.reserved, 0, sizeof(s_audio_configuration.reserved));
+    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u, channel=%u, encoder=%u)\n",
+           audioOut, config->channel, config->encoder);
+    return CELL_OK;
 }

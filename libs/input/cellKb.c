@@ -240,7 +240,7 @@ s32 cellKbSetReadMode(u32 port_no, u32 rmode)
     if (!s_kb_initialized)
         return CELL_KB_ERROR_UNINITIALIZED;
 
-    if (port_no >= CELL_KB_MAX_KEYBOARDS)
+    if (port_no >= s_kb_max_connect)
         return CELL_KB_ERROR_INVALID_PARAMETER;
 
     if (rmode != CELL_KB_RMODE_INPUTCHAR && rmode != CELL_KB_RMODE_PACKET)
@@ -257,7 +257,7 @@ s32 cellKbSetCodeType(u32 port_no, u32 codetype)
     if (!s_kb_initialized)
         return CELL_KB_ERROR_UNINITIALIZED;
 
-    if (port_no >= CELL_KB_MAX_KEYBOARDS)
+    if (port_no >= s_kb_max_connect)
         return CELL_KB_ERROR_INVALID_PARAMETER;
 
     if (codetype != CELL_KB_CODETYPE_RAW && codetype != CELL_KB_CODETYPE_ASCII)
@@ -272,7 +272,7 @@ s32 cellKbClearBuf(u32 port_no)
     if (!s_kb_initialized)
         return CELL_KB_ERROR_UNINITIALIZED;
 
-    if (port_no >= CELL_KB_MAX_KEYBOARDS)
+    if (port_no >= s_kb_max_connect)
         return CELL_KB_ERROR_INVALID_PARAMETER;
 
     memset(s_kb_ports[port_no].key_state, 0, sizeof(s_kb_ports[port_no].key_state));

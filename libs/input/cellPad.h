@@ -41,6 +41,11 @@ extern "C" {
 #define CELL_PAD_CTRL_CROSS         (1 << 14)
 #define CELL_PAD_CTRL_SQUARE        (1 << 15)
 
+/* Process-local unattended-test input. The D3D window routes a private
+ * WM_APP message here; normal keyboard/controller input is unchanged. */
+void cellPadDebugPulse(u16 buttons, u32 hold_ms);
+void cellPadDebugAnalogPulse(u8 left_x, u8 left_y, u32 hold_ms);
+
 /* PS button (in button[3] high byte) */
 #define CELL_PAD_CTRL_PS            (1 << 0)
 
@@ -70,8 +75,8 @@ extern "C" {
 /* Standard data lengths */
 #define CELL_PAD_LEN_NO_CHANGE          0
 #define CELL_PAD_LEN_CHANGE_DEFAULT     8
-#define CELL_PAD_LEN_CHANGE_PRESS_ON    24
-#define CELL_PAD_LEN_CHANGE_SENSOR_ON   28
+#define CELL_PAD_LEN_CHANGE_PRESS_ON    20
+#define CELL_PAD_LEN_CHANGE_SENSOR_ON   24
 
 /* Pressure-sensitive button offsets in button[] array */
 #define CELL_PAD_BTN_OFFSET_DIGITAL1    2
@@ -110,8 +115,8 @@ extern "C" {
  * CellPadData -- returned by cellPadGetData.
  *
  * Layout of the button[] array (each element is u16):
- *   [0] = data length (number of valid entries following)
- *   [1] = reserved
+ *   [0] = reserved
+ *   [1] = report format (0x7) and half-length
  *   [2] = digital buttons bitmask (CELL_PAD_CTRL_*)
  *   [3] = digital buttons bitmask continued (PS button, etc.)
  *   [4] = right analog stick X (0-255, center=128)
@@ -197,6 +202,18 @@ s32 cellPadClearBuf(u32 port_no);
 
 /* Internal: call once per frame to update pad state from host input */
 void cellPad_poll(void);
+
+/* PC key prompts: the primary bound key (Windows virtual-key code, 0 =
+ * unbound) of each PS3 input, in the order cross, circle, square, triangle,
+ * l1, r1, l2, r2, l3, r3, start, select, up, down, left, right, lstick
+ * up/down/left/right, rstick up/down/left/right. Lock-free; any thread.
+ * Returns 1 when PC key prompts should be shown (keyboard/mouse is the
+ * active device and the bindings are known): *sig then identifies the key
+ * set (it changes whenever any of these keys changes). Returns 0 when the
+ * original PS3 prompts should be shown (controller active, TJ_PROMPTS=0,
+ * bindings not loaded yet, or no Windows keyboard backend). */
+#define CELL_PAD_PROMPT_ACTIONS 24
+int cellPad_prompt_keys(unsigned long long* sig, int vks[CELL_PAD_PROMPT_ACTIONS]);
 
 #ifdef __cplusplus
 }

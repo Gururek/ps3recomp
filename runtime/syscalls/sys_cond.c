@@ -152,8 +152,31 @@ int64_t sys_cond_wait(ppu_context* ctx)
 {
     uint32_t cond_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
-    fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu) tid=%llu lr=0x%08X\n", cond_id, (unsigned long long)timeout_us,
-            (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+    {
+        /* First 40 waits always; every wait only with TJ_VERBOSE_STATS (file loader threads wait here per request). */
+        static int s_logged = 0, s_verbose = -1;
+        if (s_verbose < 0) s_verbose = getenv("TJ_VERBOSE_STATS") != NULL;
+        if (s_verbose || s_logged < 40) {
+            s_logged++;
+            fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu) tid=%llu lr=0x%08X\n", cond_id, (unsigned long long)timeout_us,
+                    (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+        }
+    }
+    if (cond_id == 3 && getenv("TJ_COND3TRACE")) {
+        static int s_cond3_traced = 0;
+        if (!s_cond3_traced++) {
+            extern void ppu_guest_callstack(const char*);
+            extern void ppu_dump_guest_stack(ppu_context*, const char*);
+            extern uint32_t vm_read32(uint64_t);
+            fprintf(stderr,
+                    "[cond3] r30=0x%08X r31=0x%08X pending@r31-4=%u sp=0x%08X\n",
+                    (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[31],
+                    vm_read32((uint32_t)ctx->gpr[31] - 4),
+                    (uint32_t)ctx->gpr[1]);
+            ppu_guest_callstack("cond3");
+            ppu_dump_guest_stack(ctx, "cond3");
+        }
+    }
     /* YDKJ_THREADGATE: creating thread is blocking -> let gated workers run. */
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
 #ifdef _WIN32
@@ -255,6 +278,26 @@ int64_t sys_cond_signal(ppu_context* ctx)
     uint32_t cond_id = LV2_ARG_U32(ctx, 0);
     { static int n=0; if(n++<80) fprintf(stderr,"[SIGNAL] cond_signal(cond=%u) tid=%llu lr=0x%08X\n", cond_id,
             (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr); }
+
+    if (cond_id == 2 && getenv("TJ_SGSQUEUE_TRACE")) {
+        static int s_sgsqueue_traced = 0;
+        if (!s_sgsqueue_traced++) {
+            extern uint32_t vm_read32(uint64_t);
+            extern uint64_t vm_read64(uint64_t);
+            uint32_t worker = (uint32_t)vm_read64((uint32_t)ctx->gpr[1] - 8);
+            uint32_t callback = worker ? vm_read32(worker + 0x40) : 0;
+            fprintf(stderr,
+                    "[sgsqueue] worker=0x%08X caller=0x%08X op0=0x%08X op1=0x%08X "
+                    "callback=0x%08X callback-entry=0x%08X callback-toc=0x%08X\n",
+                    worker,
+                    worker ? vm_read32(worker + 0x08) : 0,
+                    worker ? vm_read32(worker + 0x0C) : 0,
+                    worker ? vm_read32(worker + 0x10) : 0,
+                    callback,
+                    callback ? vm_read32(callback) : 0,
+                    callback ? vm_read32(callback + 4) : 0);
+        }
+    }
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;

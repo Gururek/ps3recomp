@@ -55,6 +55,31 @@ extern "C" {
 #define NV4097_SET_SURFACE_PITCH_D             0x00000284
 #define NV4097_SET_SURFACE_COLOR_COFFSET       0x00000288
 #define NV4097_SET_SURFACE_COLOR_DOFFSET       0x0000028C
+#define NV4097_SET_WINDOW_OFFSET               0x000002B8
+
+/* Context-DMA bindings for the surface offsets.  The handles are emitted by
+ * cellGcm; do not infer MAIN from an unknown value.  The old renderer had no
+ * surface-DMA tracking and therefore treated every surface as LOCAL, which
+ * remains the compatibility fallback until a handle is explicitly MAIN. */
+#define NV4097_SET_CONTEXT_DMA_COLOR_B          0x0000018C
+#define NV4097_SET_CONTEXT_DMA_COLOR_A          0x00000194
+#define NV4097_SET_CONTEXT_DMA_ZETA             0x00000198
+#define NV4097_SET_CONTEXT_DMA_COLOR_C          0x000001B4
+#define NV4097_SET_CONTEXT_DMA_COLOR_D          0x000001B8
+#define RSX_CONTEXT_DMA_LOCAL                   0xFEED0000u
+#define RSX_CONTEXT_DMA_MAIN                    0xFEED0001u
+
+static inline int rsx_surface_dma_is_local(u32 dma_handle)
+{
+    switch (dma_handle) {
+    case RSX_CONTEXT_DMA_LOCAL: return 1;
+    case RSX_CONTEXT_DMA_MAIN:  return 0;
+    default:
+        /* Unknown handles retain the established LOCAL behavior; never let
+         * an unrecognised handle silently select the MAIN resolver. */
+        return 1;
+    }
+}
 
 /* SET_SURFACE_COLOR_TARGET values */
 #define CELL_GCM_SURFACE_TARGET_NONE  0x00
@@ -74,6 +99,8 @@ extern "C" {
 /* Scissor */
 #define NV4097_SET_SCISSOR_HORIZONTAL          0x000008C0
 #define NV4097_SET_SCISSOR_VERTICAL            0x000008C4
+#define NV4097_SET_FOG_MODE                    0x000008CC
+#define NV4097_SET_FOG_PARAMS                  0x000008D0
 
 /* Clear */
 #define NV4097_SET_COLOR_CLEAR_VALUE           0x00001D90
@@ -82,14 +109,29 @@ extern "C" {
 
 /* Draw commands */
 #define NV4097_SET_BEGIN_END                    0x00001808
+#define NV4097_ARRAY_ELEMENT16                  0x0000180C
+#define NV4097_ARRAY_ELEMENT32                  0x00001810
 #define NV4097_DRAW_ARRAYS                     0x00001814
+#define NV4097_INLINE_ARRAY                     0x00001818
 #define NV4097_SET_INDEX_ARRAY_ADDRESS         0x0000181C
 #define NV4097_SET_INDEX_ARRAY_DMA             0x00001820
 #define NV4097_DRAW_INDEX_ARRAY                0x00001824
+#define NV4097_SET_RESTART_INDEX_ENABLE        0x00001DAC
+#define NV4097_SET_RESTART_INDEX               0x00001DB0
 
 /* Vertex attributes */
 #define NV4097_SET_VERTEX_DATA_ARRAY_FORMAT     0x00001740
 #define NV4097_SET_VERTEX_DATA_ARRAY_OFFSET     0x00001680
+#define NV4097_SET_VERTEX_DATA_BASE_OFFSET      0x00001738
+#define NV4097_SET_VERTEX_DATA_BASE_INDEX       0x0000173C
+#define NV4097_SET_VERTEX_DATA_SCALED4S_M       0x00000A80
+#define NV4097_SET_VERTEX_DATA3F_M              0x00001500
+#define NV4097_SET_VERTEX_DATA2F_M              0x00001880
+#define NV4097_SET_VERTEX_DATA2S_M              0x00001900
+#define NV4097_SET_VERTEX_DATA4UB_M             0x00001940
+#define NV4097_SET_VERTEX_DATA4S_M              0x00001980
+#define NV4097_SET_VERTEX_DATA4F_M              0x00001C00
+#define NV4097_SET_VERTEX_DATA1F_M              0x00001E40
 
 /* Texture */
 #define NV4097_SET_TEXTURE_OFFSET               0x00001A00
@@ -100,15 +142,45 @@ extern "C" {
 #define NV4097_SET_TEXTURE_FILTER               0x00001A14
 #define NV4097_SET_TEXTURE_IMAGE_RECT           0x00001A18
 #define NV4097_SET_TEXTURE_BORDER_COLOR         0x00001A1C
+/* One register per texture unit (unit stride = 4, unlike the 0x1A00 block).
+ * bits [15:0] = linear row pitch, bits [31:20] = depth. */
+#define NV4097_SET_TEXTURE_SIZE1                 0x00001840
+
+/* Vertex textures: four units, eight registers per unit (0x20-byte stride). */
+#define NV4097_SET_VERTEX_TEXTURE_OFFSET         0x00000900
+#define NV4097_SET_VERTEX_TEXTURE_FORMAT         0x00000904
+#define NV4097_SET_VERTEX_TEXTURE_ADDRESS        0x00000908
+#define NV4097_SET_VERTEX_TEXTURE_CONTROL0       0x0000090C
+#define NV4097_SET_VERTEX_TEXTURE_CONTROL3       0x00000910
+#define NV4097_SET_VERTEX_TEXTURE_FILTER         0x00000914
+#define NV4097_SET_VERTEX_TEXTURE_IMAGE_RECT     0x00000918
+#define NV4097_SET_VERTEX_TEXTURE_BORDER_COLOR   0x0000091C
+#define NV4097_SET_TEX_COORD_CONTROL             0x00000B40
+#define NV4097_SET_TWO_SIDE_LIGHT_EN             0x0000142C
+#define NV4097_SET_USER_CLIP_PLANE_CONTROL       0x00001478
 
 /* Shader programs */
 #define NV4097_SET_SHADER_PROGRAM               0x000008E4
 #define NV4097_SET_SHADER_CONTROL               0x00001D60
+#define NV4097_SET_SHADER_WINDOW                0x00001D88
+#define NV4097_SET_SHADER_PACKER                0x00001FEC
+/* SET_SHADER_PROGRAM low bits encode location + 1: LOCAL=1, MAIN=2.
+ * Return zero for the reserved encodings 0 and 3. */
+static inline int rsx_shader_program_location_is_local(u32 program, int* out_local)
+{
+    u32 location = program & 0x3u;
+    if (!out_local || location < 1u || location > 2u) return 0;
+    *out_local = location == 1u;
+    return 1;
+}
 /* shader_control bit: fragment colour exports come from r0/r2/r3/r4 (32-bit)
  * instead of h0/h4/h6/h8 (half). */
 #define CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS 0x00000040
+#define NV4097_SET_VERTEX_ATTRIB_INPUT_MASK     0x00001FF0
 #define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF4
 #define NV4097_SET_TRANSFORM_PROGRAM_LOAD       0x00001E9C
+#define NV4097_SET_TRANSFORM_PROGRAM_START      0x00001EA0
+#define NV4097_SET_TRANSFORM_BRANCH_BITS        0x00001FF8
 #define NV4097_SET_TRANSFORM_PROGRAM            0x00000B80
 #define NV4097_SET_TRANSFORM_CONSTANT_LOAD      0x00001EFC
 /* Vertex constants are written as up to 64 dwords (16 vec4s) per command,
@@ -131,23 +203,49 @@ extern "C" {
 #define NV4097_SET_BLEND_FUNC_DFACTOR           0x00000318
 #define NV4097_SET_BLEND_EQUATION               0x00000320
 #define NV4097_SET_BLEND_COLOR                  0x0000031C
+#define NV4097_SET_BLEND_ENABLE_MRT             0x0000036C
+#define NV4097_SET_COLOR_MASK_MRT               0x00000370
+#define NV4097_SET_LOGIC_OP_ENABLE              0x00000374
+#define NV4097_SET_LOGIC_OP                     0x00000378
+#define NV4097_SET_BLEND_COLOR2                 0x0000037C
+#define NV4097_SET_SHADE_MODE                   0x00000368
 
 /* Depth / stencil */
+#define NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE     0x00000380
+#define NV4097_SET_DEPTH_BOUNDS_MIN             0x00000384
+#define NV4097_SET_DEPTH_BOUNDS_MAX             0x00000388
 #define NV4097_SET_DEPTH_TEST_ENABLE            0x00000A74
 #define NV4097_SET_DEPTH_FUNC                   0x00000A6C
 #define NV4097_SET_DEPTH_MASK                   0x00000A70
+#define NV4097_SET_POLY_OFFSET_POINT_ENABLE     0x00000A60
+#define NV4097_SET_POLY_OFFSET_LINE_ENABLE      0x00000A64
+#define NV4097_SET_POLY_OFFSET_FILL_ENABLE      0x00000A68
+#define NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR  0x00000A78
+#define NV4097_SET_POLYGON_OFFSET_BIAS          0x00000A7C
+#define NV4097_SET_ZMIN_MAX_CONTROL             0x00001D78
 #define NV4097_SET_STENCIL_TEST_ENABLE          0x00000328
+#define NV4097_SET_STENCIL_MASK                 0x0000032C
 #define NV4097_SET_STENCIL_FUNC                 0x00000330
 #define NV4097_SET_STENCIL_FUNC_REF             0x00000334
 #define NV4097_SET_STENCIL_FUNC_MASK            0x00000338
 #define NV4097_SET_STENCIL_OP_FAIL              0x0000033C
 #define NV4097_SET_STENCIL_OP_ZFAIL             0x00000340
 #define NV4097_SET_STENCIL_OP_ZPASS             0x00000344
+#define NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE 0x00000348
+#define NV4097_SET_BACK_STENCIL_MASK            0x0000034C
+#define NV4097_SET_BACK_STENCIL_FUNC            0x00000350
+#define NV4097_SET_BACK_STENCIL_FUNC_REF        0x00000354
+#define NV4097_SET_BACK_STENCIL_FUNC_MASK       0x00000358
+#define NV4097_SET_BACK_STENCIL_OP_FAIL         0x0000035C
+#define NV4097_SET_BACK_STENCIL_OP_ZFAIL        0x00000360
+#define NV4097_SET_BACK_STENCIL_OP_ZPASS        0x00000364
 
 /* Culling */
 #define NV4097_SET_CULL_FACE_ENABLE             0x0000183C
 #define NV4097_SET_CULL_FACE                    0x00001830
 #define NV4097_SET_FRONT_FACE                   0x00001834
+#define NV4097_SET_FRONT_POLYGON_MODE           0x00001828
+#define NV4097_SET_BACK_POLYGON_MODE            0x0000182C
 
 /* Primitive types */
 #define RSX_PRIMITIVE_POINTS             1
@@ -161,11 +259,22 @@ extern "C" {
 #define RSX_PRIMITIVE_QUAD_STRIP         9
 #define RSX_PRIMITIVE_POLYGON            10
 
+/* NV4097_CLEAR_SURFACE bit mask. */
+#define RSX_CLEAR_DEPTH_BIT               0x01u
+#define RSX_CLEAR_STENCIL_BIT             0x02u
+#define RSX_CLEAR_RED_BIT                 0x10u
+#define RSX_CLEAR_GREEN_BIT               0x20u
+#define RSX_CLEAR_BLUE_BIT                0x40u
+#define RSX_CLEAR_ALPHA_BIT               0x80u
+#define RSX_CLEAR_COLOR_MASK              0xF0u
+#define RSX_CLEAR_DEPTH_STENCIL_MASK      0x03u
+
 /* ---------------------------------------------------------------------------
  * RSX State — tracked as methods are processed
  * -----------------------------------------------------------------------*/
 
 #define RSX_MAX_TEXTURES          16
+#define RSX_MAX_VERTEX_TEXTURES    4
 #define RSX_MAX_VERTEX_ATTRIBS    16
 #define RSX_MAX_RENDER_TARGETS     4
 
@@ -178,6 +287,8 @@ typedef struct rsx_texture_state {
     u32 filter;
     u32 image_rect;
     u32 border_color;
+    u32 pitch;
+    u32 depth;
     int dirty;
 } rsx_texture_state;
 
@@ -196,10 +307,13 @@ typedef struct rsx_state {
     u32 surface_format;
     u32 surface_color_offset[RSX_MAX_RENDER_TARGETS];
     u32 surface_color_pitch[RSX_MAX_RENDER_TARGETS];
+    u32 surface_color_dma[RSX_MAX_RENDER_TARGETS];
     u32 surface_zeta_offset;
     u32 surface_zeta_pitch;
+    u32 surface_zeta_dma;
     u32 surface_clip_x, surface_clip_y;
     u32 surface_clip_w, surface_clip_h;
+    u32 window_offset_x, window_offset_y;
     u32 color_target;
 
     /* Viewport */
@@ -209,33 +323,58 @@ typedef struct rsx_state {
     /* Scissor */
     u32 scissor_x, scissor_y, scissor_w, scissor_h;
 
+    /* Fixed fragment-input fog equation. */
+    u32 fog_mode;
+    float fog_param[2];
+
     /* Clear */
     u32 color_clear_value;
     u32 zstencil_clear_value;
 
     /* Blend */
     int blend_enable;
+    u32 blend_enable_mrt;
     u32 blend_sfactor, blend_dfactor;
     u32 blend_equation;
-    u32 blend_color;
+    u32 blend_color, blend_color2;
+    int logic_op_enable;
+    u32 logic_op;
 
     /* Depth */
     int depth_test_enable;
     u32 depth_func;
     int depth_mask;
+    int depth_bounds_test_enable;
+    float depth_bounds_min;
+    float depth_bounds_max;
+    int poly_offset_point_enable;
+    int poly_offset_line_enable;
+    int poly_offset_fill_enable;
+    float polygon_offset_scale_factor;
+    float polygon_offset_bias;
+    u32 zmin_max_control;
 
     /* Stencil */
     int stencil_test_enable;
+    u32 stencil_write_mask;
     u32 stencil_func, stencil_ref, stencil_mask;
     u32 stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
+    int two_sided_stencil_test_enable;
+    u32 back_stencil_write_mask;
+    u32 back_stencil_func, back_stencil_ref, back_stencil_mask;
+    u32 back_stencil_op_fail, back_stencil_op_zfail, back_stencil_op_zpass;
 
     /* Culling */
     int cull_face_enable;
     u32 cull_face;
     u32 front_face;
+    u32 front_polygon_mode;
+    u32 back_polygon_mode;
+    u32 shade_mode;
 
     /* Color mask — bits: [0] B, [8] G, [16] R, [24] A */
     u32 color_mask;
+    u32 color_mask_mrt;
     int color_mask_dirty;
 
     /* Alpha test */
@@ -246,9 +385,15 @@ typedef struct rsx_state {
 
     /* Textures */
     rsx_texture_state textures[RSX_MAX_TEXTURES];
+    rsx_texture_state vertex_textures[RSX_MAX_VERTEX_TEXTURES];
 
     /* Vertex attributes */
     rsx_vertex_attrib vertex_attribs[RSX_MAX_VERTEX_ATTRIBS];
+    u32 vertex_data_base_offset; /* added to array offsets, then masked to 28 bits */
+    u32 vertex_data_base_index;  /* added to indexed vertices, then masked to 20 bits */
+    /* Constant/current values written through NV4097_SET_VERTEX_DATA4F_M.
+     * A disabled array feeds this register to every vertex. */
+    float vertex_data4f[RSX_MAX_VERTEX_ATTRIBS][4];
     /* NV4097_SET_FREQUENCY_DIVIDER_OPERATION (0x1FC0): per-attribute bitmask
      * selecting how the frequency divisor is applied -- bit set = MODULO
      * (index = vertex % freq, repeats a mesh), clear = DIVIDE (index =
@@ -259,11 +404,36 @@ typedef struct rsx_state {
     u32 primitive_type;
     int in_begin_end;  /* between BEGIN_END(type) and BEGIN_END(0) */
 
+    /* Transient immediate-mode sources.  The command processor owns these
+     * host buffers and exposes them only for the synchronous backend call at
+     * END.  Register push-buffer draws ignore persistent vertex arrays;
+     * attributes in immediate_vertex_mask come from the vertex-major float4
+     * stream and the remaining attributes use vertex_data4f constants.
+     * ARRAY_ELEMENT16/32 similarly overrides the bound guest index array. */
+    const float* immediate_vertex_data; /* [vertex][16][4], host float */
+    u32 immediate_vertex_count;
+    u32 immediate_vertex_mask;
+    const u32* immediate_index_data;    /* raw host-endian indices */
+    u32 immediate_index_count;
+    u32 immediate_draw_kind;            /* 0 none, 1 arrays, 2 indexed, 3 inline */
+
     /* Index array (SET_INDEX_ARRAY_ADDRESS/_DMA): offset is a raw RSX offset;
      * dma bits [3:0] = location context (0=local 1=main via CELL_GCM_DMA ids),
      * bits [7:4] = index type (0 = u32, 1 = u16). */
     u32 index_array_offset;
     u32 index_array_dma;
+    int restart_index_enable;
+    u32 restart_index;
+
+    /* Consecutive indexed packets inside one BEGIN_END stream describe one
+     * logical primitive stream.  Delay their backend submission so adjacent,
+     * contiguous ranges retain triangle-list continuity. */
+    int pending_indexed_valid;
+    u32 pending_indexed_primitive;
+    u32 pending_indexed_first;
+    u32 pending_indexed_count;
+    u32 pending_indexed_offset;
+    u32 pending_indexed_dma;
 
     /* Shader state */
     /* RSX viewport transform (SET_VIEWPORT_OFFSET 0x0A20 / _SCALE 0x0A30,
@@ -272,9 +442,17 @@ typedef struct rsx_state {
     float viewport_scale[4];
     u32 shader_program;       /* fragment program address (offset | location in bits [0:1]) */
     u32 shader_control;       /* SET_SHADER_CONTROL (0x40 = 32-bit colour exports) */
+    u32 shader_packer;        /* SET_SHADER_PACKER (nonzero = half-export sRGB packing) */
+    u32 shader_window;        /* height[11:0], origin[15:12], pixel center[19:16] */
+    u32 texcoord_control_mask;/* ten SET_TEX_COORD_CONTROL 2D override bits */
+    int two_side_light_enable;
     u32 fragment_program_addr;
+    u32 vertex_attrib_input_mask; /* enabled VP inputs; reset value 0xFFFF */
     u32 vertex_attrib_output_mask;
+    u32 user_clip_plane_control; /* six 4-bit modes: 0 off, 1 LT, 2 GE */
     u32 transform_program_load; /* vertex program load slot index */
+    u32 transform_program_start; /* selected vertex program instruction index */
+    u32 transform_branch_bits;  /* boolean constants b[0..31] for BRB/CLB */
     u32 transform_constant_load;
     int shader_dirty;
 
@@ -288,6 +466,18 @@ typedef struct rsx_state {
     u32 vertex_constants_lo;
     u32 vertex_constants_hi;
     int vertex_constants_dirty;
+
+    /* TJ_TCONST_PROBE_C4_7=1 only: method-order provenance for c4..c7.
+     * A zero last-write sequence means that lane has never been written since
+     * rsx_state_init.  Kept in state so the renderer observes the exact FIFO
+     * history belonging to its current command stream. */
+    int tconst_probe_enabled;
+    u64 tconst_probe_method_sequence;
+    u64 tconst_probe_last_sequence[4][4];
+    u32 tconst_probe_last_raw[4][4];
+    u32 tconst_probe_last_load[4][4];
+    u32 tconst_probe_last_slot[4][4];
+    u32 tconst_probe_last_lane[4][4];
 
     /* Captured RSX vertex program microcode (NV40 ISA), filled by
      * NV4097_SET_TRANSFORM_PROGRAM. Words are host-endian (as delivered by the
@@ -305,6 +495,7 @@ typedef struct rsx_state {
     int depth_dirty;
     int stencil_dirty;
     int texture_dirty;
+    int vertex_texture_dirty;
     int vertex_dirty;
 } rsx_state;
 
@@ -314,6 +505,12 @@ typedef struct rsx_state {
 
 /* Initialize RSX state to defaults */
 void rsx_state_init(rsx_state* state);
+
+/* HLE flip/context reset: retain uploaded programs, constants and texture storage. */
+void rsx_state_reset(rsx_state* state);
+
+/* Submit deferred indexed spans before a FIFO-owned completion boundary. */
+void rsx_flush_pending_draws(rsx_state* state);
 
 /* Process a single NV47xx method call.
  * method: register address (e.g., NV4097_SET_BLEND_ENABLE)
@@ -362,6 +559,11 @@ typedef struct rsx_backend {
 
     /* Texture */
     void (*bind_texture)(void* userdata, u32 unit, const rsx_texture_state* tex);
+    void (*bind_vertex_texture)(void* userdata, u32 unit,
+                                const rsx_texture_state* tex);
+    /* Optional FIFO-owner handshake: consume an already-prepared texture
+     * label, retaining its publication until checked GPU completion. */
+    int (*defer_texture_label)(void* userdata, u32 offset, u32 value);
 } rsx_backend;
 
 /* Register a backend. Call before any RSX processing. */

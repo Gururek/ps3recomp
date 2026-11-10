@@ -107,6 +107,8 @@ typedef struct CellFontGlyphImage {
     s32  pixelSizeByte;
     s32  width;
     s32  height;
+    s32  x;             /* glyph origin within the destination surface */
+    s32  y;
 } CellFontGlyphImage;
 
 /* Renderer handle */
@@ -129,6 +131,7 @@ s32 cellFontEnd(void);
 s32 cellFontOpenFontFile(CellFont* font, const char* fontPath, u32 subNum, s32 uniqueId);
 s32 cellFontOpenFontMemory(CellFont* font, const void* data, u32 dataSize, u32 subNum, s32 uniqueId);
 s32 cellFontOpenFontset(CellFontLibrary lib, CellFontType* fontType, CellFont* font);
+s32 cellFontOpenFontInstance(CellFont* source, CellFont* font);
 s32 cellFontCloseFont(CellFont* font);
 
 s32 cellFontSetFontOpenMode(u32 openMode);
@@ -139,6 +142,8 @@ s32 cellFontBindRenderer(CellFont* font, CellFontRenderer renderer);
 s32 cellFontUnbindRenderer(CellFont* font);
 
 s32 cellFontSetScalePixel(CellFont* font, float w, float h);
+s32 cellFontSetScalePoint(CellFont* font, float w, float h);
+s32 cellFontSetResolutionDpi(CellFont* font, u32 hDpi, u32 vDpi);
 s32 cellFontSetEffectWeight(CellFont* font, float weight);
 s32 cellFontSetEffectSlant(CellFont* font, float slant);
 
@@ -152,6 +157,12 @@ s32 cellFontRenderCharGlyphImage(CellFont* font, u32 code,
 
 s32 cellFontGetRenderCharGlyphMetrics(CellFont* font, u32 code,
                                        CellFontGlyphMetrics* metrics);
+
+s32 cellFontGetCharGlyphMetrics(CellFont* font, u32 code,
+                                CellFontGlyphMetrics* metrics);
+
+s32 cellFontGetFontIdCode(CellFont* font, u32 code,
+                          u32* fontId, u32* fontCode);
 
 s32 cellFontGetRenderCharGlyphMetricsVertical(CellFont* font, u32 code,
                                                CellFontGlyphMetrics* metrics);

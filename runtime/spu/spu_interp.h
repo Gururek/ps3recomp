@@ -28,10 +28,18 @@ typedef void (*spu_lifted_fn)(spu_context*);
  * overrides this so computed branches reach compiled code. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
 
-/* Interpret from `start_lsa` until the SPU stops (`stop`/`stopd`/halt) or a
- * host-fatal decode. Handles all control flow internally. Returns the stop
- * code (0 if none). ctx->pc holds the address that stopped execution. */
+/* Interpret from `start_lsa` until the SPU stops (`stop`/`stopd`/halt) or reaches
+ * a registered lifted entry. Handles all control flow internally. Returns the
+ * stop code after a stop/halt, or the lifted entry address for re-dispatch.
+ * The optional YDKJ_SPU_STEPCAP diagnostic returns 0x2000. ctx->pc is the next
+ * instruction after stop, the offending instruction after halt, or that entry. */
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa);
+
+/* Execute exactly the instruction at ctx->pc from live local store. This does
+ * not consult lifted code or alter ctx->status before execution. Returns 1
+ * when the instruction stops/halts the SPU. When non-NULL, branch_taken is
+ * reset to 0 then set to 1 only for a control-flow branch that is taken. */
+int spu_interp_step(spu_context* ctx, int* branch_taken);
 
 /* The single dispatch point every computed branch routes through. If `target`
  * is a registered lifted entry, runs it; otherwise interprets from `target`.

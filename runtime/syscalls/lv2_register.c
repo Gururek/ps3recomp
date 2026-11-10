@@ -23,12 +23,16 @@
 #include "sys_memory.h"
 #include "sys_vm.h"
 #include "sys_fs.h"
+#include "sys_gpio.h"
 #include "ps3emu/spu_fallback.h"
 #include "../spu/spu_lifted_job.h"   /* spu_run_interp_job — run un-lifted SPU images */
+#include "../memory/guest_world_rendezvous.h"
 #include "sys_event.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include "../../include/ps3emu/error_codes.h"
 
 /* ---------------------------------------------------------------------------
  * TTY syscalls (used by PS3 CRT for debug output)
@@ -40,6 +44,14 @@
  * -----------------------------------------------------------------------*/
 
 extern uint8_t* vm_base;
+extern uint32_t ppu_vm_size;
+
+static int vm_guest_writable_range(uint32_t guest_addr, uint32_t size)
+{
+    return vm_base && guest_addr &&
+           (!ppu_vm_size || ((uint64_t)guest_addr <= ppu_vm_size &&
+                             size <= ppu_vm_size - guest_addr));
+}
 
 static int64_t sys_tty_write(ppu_context* ctx)
 {
@@ -223,8 +235,15 @@ typedef struct {
 } spu_thread_event_t;
 #endif
 
+/* A queue id alone can name a later queue after destroy/reuse. */
+typedef struct {
+    uint32_t id;
+    uint32_t generation;
+} spu_event_binding_t;
+
 typedef struct {
     int      in_use;
+    uint32_t op_refs;       /* stable-operation references; slot not reusable */
     uint32_t tid;            /* thread id (unique across all groups) */
     uint32_t group_id;       /* parent group */
     uint32_t index;          /* slot within the group */
@@ -254,16 +273,17 @@ typedef struct {
      * common pattern where the PPU writes job state into LS, the SPU runs
      * and writes results back to LS, then PPU reads them. */
     uint8_t*            local_store;
-    /* sys_spu_thread_connect_event(thread, eq, et): binds this SPU thread's
-     * outbound interrupt-mailbox events to a PPU event queue. When the SPU
-     * writes WrOutIntrMbox (or stop-and-signals), the runtime delivers an event
-     * to connected_queue so PPU code blocked in sys_event_queue_receive wakes. */
-    uint32_t            connected_queue;
-    uint32_t            connect_spup;
+    /* One actual inbound mailbox per LV2 SPU thread.  Lifted/interpreted
+     * runners alias it, so PPU writes remain visible across runner re-entry. */
+    spu_inbound_mailbox in_mbox;
+    /* sys_spu_thread_[dis]connect_event: one queue per SPU user-event port.
+     * Zero means disconnected; this is sole ownership of thread event binds. */
+    spu_event_binding_t event_queue_by_spup[64];
 } spu_thread_t;
 
 typedef struct {
     int      in_use;
+    uint32_t op_refs;
     uint32_t id;
     int      state;
     uint32_t num_threads;
@@ -284,6 +304,16 @@ static uint32_t     s_spu_next_group_id  = 0x1000;
 static uint32_t     s_spu_next_thread_id = 0x2000;
 static int          s_spu_initialized    = 0;
 
+#ifdef _WIN32
+static SRWLOCK s_spu_table_lock = SRWLOCK_INIT;
+static void spu_table_lock(void) { AcquireSRWLockExclusive(&s_spu_table_lock); }
+static void spu_table_unlock(void) { ReleaseSRWLockExclusive(&s_spu_table_lock); }
+#else
+static pthread_mutex_t s_spu_table_lock = PTHREAD_MUTEX_INITIALIZER;
+static void spu_table_lock(void) { pthread_mutex_lock(&s_spu_table_lock); }
+static void spu_table_unlock(void) { pthread_mutex_unlock(&s_spu_table_lock); }
+#endif
+
 static spu_group_t* spu_find_group(uint32_t id)
 {
     for (int i = 0; i < MAX_SPU_GROUPS; i++) {
@@ -295,6 +325,7 @@ static spu_group_t* spu_find_group(uint32_t id)
 
 static spu_group_t* spu_alloc_group(void)
 {
+    spu_table_lock();
     for (int i = 0; i < MAX_SPU_GROUPS; i++) {
         if (!s_spu_groups[i].in_use) {
             memset(&s_spu_groups[i], 0, sizeof(s_spu_groups[i]));
@@ -303,9 +334,11 @@ static spu_group_t* spu_alloc_group(void)
             s_spu_groups[i].state  = SPU_GROUP_STATE_INITIALIZED;
             s_spu_groups[i].exit_status = 0;
             s_spu_groups[i].cause  = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
+            spu_table_unlock();
             return &s_spu_groups[i];
         }
     }
+    spu_table_unlock();
     return NULL;
 }
 
@@ -318,16 +351,79 @@ static spu_thread_t* spu_find_thread(uint32_t tid)
     return NULL;
 }
 
+static spu_thread_t* spu_thread_acquire(uint32_t tid)
+{
+    spu_thread_t* t;
+    spu_table_lock();
+    t = spu_find_thread(tid);
+    if (t) t->op_refs++;
+    spu_table_unlock();
+    return t;
+}
+
+static void spu_thread_release(spu_thread_t* t)
+{
+    if (!t) return;
+    spu_table_lock();
+    if (t->op_refs) t->op_refs--;
+    spu_table_unlock();
+}
+
+static spu_group_t* spu_group_acquire(uint32_t id)
+{
+    spu_group_t* g;
+    spu_table_lock();
+    g = spu_find_group(id);
+    if (g) g->op_refs++;
+    spu_table_unlock();
+    return g;
+}
+
+static void spu_group_release(spu_group_t* g)
+{
+    if (!g) return;
+    spu_table_lock();
+    if (g->op_refs) g->op_refs--;
+    spu_table_unlock();
+}
+
+#define SYS_SPU_THREAD_EVENT_USER 1u
+
+static int spu_event_queue_is_live(uint32_t id)
+{
+    return id != 0 && sys_event_queue_generation(id) != 0;
+}
+
+static uint32_t spu_thread_first_event_queue(const spu_thread_t* t)
+{
+    if (!t) return 0;
+    for (uint32_t spup = 0; spup < 64; spup++)
+        if (t->event_queue_by_spup[spup].id) return t->event_queue_by_spup[spup].id;
+    return 0;
+}
+
+static int spu_thread_has_event_queue(const spu_thread_t* t, uint32_t queue_id)
+{
+    if (!t || !queue_id) return 0;
+    for (uint32_t spup = 0; spup < 64; spup++)
+        if (t->event_queue_by_spup[spup].id == queue_id) return 1;
+    return 0;
+}
+
 static spu_thread_t* spu_alloc_thread(void)
 {
+    spu_table_lock();
     for (int i = 0; i < MAX_SPU_THREADS; i++) {
         if (!s_spu_threads[i].in_use) {
             memset(&s_spu_threads[i], 0, sizeof(s_spu_threads[i]));
+            spu_in_mbox_init(&s_spu_threads[i].in_mbox);
             s_spu_threads[i].in_use = 1;
             s_spu_threads[i].tid    = s_spu_next_thread_id++;
+            spu_table_unlock();
             return &s_spu_threads[i];
         }
     }
+    spu_table_unlock();
     return NULL;
 }
 
@@ -349,6 +445,46 @@ static uint32_t vm_read_be32(uint32_t guest_addr)
     const uint8_t* p = vm_base + guest_addr;
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] <<  8) | (uint32_t)p[3];
+}
+
+/* sys_time_get_timezone(s32* timezone_minutes, s32* summertime_minutes).
+ * CellOS reports minutes east of UTC and a separate current daylight offset.
+ * Mirror the host's current Windows timezone exactly as RPCS3 does. */
+static int64_t sys_time_get_timezone_handler(ppu_context* ctx)
+{
+    uint32_t timezone_ea = (uint32_t)ctx->gpr[3];
+    uint32_t summertime_ea = (uint32_t)ctx->gpr[4];
+    if (!vm_guest_writable_range(timezone_ea, 4) ||
+        !vm_guest_writable_range(summertime_ea, 4)) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT;
+        return (int64_t)(int32_t)CELL_EFAULT;
+    }
+
+    int32_t timezone = 0;
+    int32_t summertime = 0;
+#ifdef _WIN32
+    TIME_ZONE_INFORMATION host_tz;
+    DWORD state = GetTimeZoneInformation(&host_tz);
+    if (state == TIME_ZONE_ID_INVALID)
+        return (int64_t)(int32_t)CELL_EINVAL;
+    timezone = -(int32_t)host_tz.Bias;
+    if (state == TIME_ZONE_ID_STANDARD)
+        summertime = -(int32_t)host_tz.StandardBias;
+    else if (state == TIME_ZONE_ID_DAYLIGHT)
+        summertime = -(int32_t)host_tz.DaylightBias;
+#else
+    time_t now = time(NULL);
+    struct tm local_tm;
+    struct tm utc_tm;
+    localtime_r(&now, &local_tm);
+    gmtime_r(&now, &utc_tm);
+    timezone = (int32_t)difftime(mktime(&local_tm), mktime(&utc_tm)) / 60;
+    summertime = local_tm.tm_isdst > 0 ? 60 : 0;
+#endif
+    vm_write_be32(timezone_ea, (uint32_t)timezone);
+    vm_write_be32(summertime_ea, (uint32_t)summertime);
+    ctx->gpr[3] = CELL_OK;
+    return CELL_OK;
 }
 
 /* syscall 872: sys_ss_get_open_psid(CellSsOpenPSID* psid { u64 high; u64 low })
@@ -476,7 +612,7 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     /* attr_ea         = (uint32_t)ctx->gpr[7];  // unused */
     uint32_t args_ea    = (uint32_t)ctx->gpr[8];
 
-    spu_group_t* g = spu_find_group(group_id);
+    spu_group_t* g = spu_group_acquire(group_id);
     if (!g) {
         fprintf(stderr, "[SPU] thread_init: group 0x%X not found\n", group_id);
         fflush(stderr);
@@ -485,6 +621,7 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     }
     spu_thread_t* t = spu_alloc_thread();
     if (!t) {
+        spu_group_release(g);
         ctx->gpr[3] = (uint64_t)(int64_t)-1;
         return -1;
     }
@@ -552,6 +689,7 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     fprintf(stderr, "[SPU] thread_init group=0x%X index=%u img=0x%08X args=0x%08X -> tid=0x%X entry=0x%08X\n",
             group_id, thread_num, img_ea, args_ea, t->tid, t->entry_point);
     fflush(stderr);
+    spu_group_release(g);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -563,6 +701,13 @@ static DWORD WINAPI spu_fallback_thread_proc(LPVOID arg)
 static void* spu_fallback_thread_proc(void* arg)
 #endif
 {
+    if (!guest_world_register_current("spu-fallback")) {
+#ifdef _WIN32
+        return 0;
+#else
+        return NULL;
+#endif
+    }
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
@@ -576,17 +721,19 @@ static void* spu_fallback_thread_proc(void* arg)
      * to the connected queue -- PPU code may block in sys_event_queue_receive for
      * the SPU's completion signal (which normally comes from a WrOutIntrMbox the
      * SPU issues before finishing). Tests whether the render hang is that wait. */
-    if (getenv("RD_SPU_DONE_EVENT") && t->connected_queue) {
+    uint32_t done_queue = spu_thread_first_event_queue(t);
+    if (getenv("RD_SPU_DONE_EVENT") && done_queue) {
         extern int sys_event_queue_push_by_id(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
-        sys_event_queue_push_by_id(t->connected_queue,
+        sys_event_queue_push_by_id(done_queue,
             ((uint64_t)t->tid << 32) | 0x2u, (uint64_t)(uint32_t)rc, 0, 0);
         fprintf(stderr, "[SPU-DONE-EVT] tid=0x%X rc=0x%X -> queue=%u\n",
-                t->tid, rc, t->connected_queue);
+                t->tid, rc, done_queue);
     }
     /* Mark complete and signal anyone waiting in group_join. */
 #ifdef _WIN32
     t->running = 0;
     SetEvent(t->finish_event);
+    guest_world_unregister_current();
     return 0;
 #else
     pthread_mutex_lock(&t->finish_event.mu);
@@ -594,6 +741,7 @@ static void* spu_fallback_thread_proc(void* arg)
     t->finish_event.done = 1;
     pthread_cond_broadcast(&t->finish_event.cv);
     pthread_mutex_unlock(&t->finish_event.mu);
+    guest_world_unregister_current();
     return NULL;
 #endif
 }
@@ -632,10 +780,13 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
                                    uint32_t args_size, void* user)
 {
     (void)args_size; (void)user;
-    spu_thread_t* t = spu_find_thread(tid);
+    spu_thread_t* t = spu_thread_acquire(tid);
     if (!t) return -1;
     uint8_t* ls = spu_thread_get_or_alloc_ls(t);
-    if (!ls) return -1;
+    if (!ls) {
+        spu_thread_release(t);
+        return -1;
+    }
     uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
     if (getenv("RD_SPU_ARGS") && vm_base && args_ea) {
         fprintf(stderr, "[SPU-ARGS] tid=0x%X args@0x%08X:", tid, args_ea);
@@ -645,10 +796,11 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
     fprintf(stderr, "[SPU-INTERP] tid=0x%X entry=0x%05X img=0x%08X args=0x%08X -> interpreting\n",
             tid, entry, t->img_ea, args_ea);
     int32_t sc = spu_run_interp_job(ls, entry, args_ea, -1,  /* pure interp: no fast-path rejoin */
-                                    t->tid, t->group_id, 0); /* identify for mbox->event delivery */
+                                    t->tid, t->group_id, 0, &t->in_mbox); /* identify for mbox->event delivery */
     { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
       fprintf(stderr, "[SPU-INTERP] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
               tid, sc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
+    spu_thread_release(t);
     return sc;
 }
 
@@ -662,14 +814,29 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
 {
     if (!getenv("RD_SPU_INTERP")) return 0;
     for (uint32_t i = 0; i < MAX_SPU_THREADS; i++) {
-        spu_thread_t* t = &s_spu_threads[i];
-        if (!t->in_use || t->connected_queue != comp_queue || !t->img_ea) continue;
+        uint32_t tid = 0;
+        spu_table_lock();
+        if (s_spu_threads[i].in_use)
+            tid = s_spu_threads[i].tid;
+        spu_table_unlock();
+        if (!tid) continue;
+        spu_thread_t* t = spu_thread_acquire(tid);
+        if (!t) continue;
+        if (!spu_thread_has_event_queue(t, comp_queue) || !t->img_ea) {
+            spu_thread_release(t);
+            continue;
+        }
         uint8_t* ls = spu_thread_get_or_alloc_ls(t);
-        if (!ls) return 0;
+        if (!ls) {
+            spu_thread_release(t);
+            return 0;
+        }
         uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
         fprintf(stderr, "[SPU-FRAME] tid=0x%X q=%u work=0x%08X -> re-run\n",
                 t->tid, comp_queue, work_ea);
-        spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id, work_ea);
+        spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id,
+                           work_ea, &t->in_mbox);
+        spu_thread_release(t);
         return 1;
     }
     return 0;
@@ -679,7 +846,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
 static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
 {
     uint32_t id = (uint32_t)ctx->gpr[3];
-    spu_group_t* g = spu_find_group(id);
+    spu_group_t* g = spu_group_acquire(id);
     if (!g) { ctx->gpr[3] = (uint64_t)(int64_t)-1; return -1; }
     g->state = SPU_GROUP_STATE_RUNNING;
 
@@ -784,6 +951,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 id, spawned, instant);
     }
     fflush(stderr);
+    spu_group_release(g);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -795,7 +963,7 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
     uint32_t cause_ea   = (uint32_t)ctx->gpr[4];
     uint32_t status_ea  = (uint32_t)ctx->gpr[5];
 
-    spu_group_t* g = spu_find_group(id);
+    spu_group_t* g = spu_group_acquire(id);
     if (!g) {
         /* Unknown group id — Sony returns CELL_ESRCH but we've seen
          * games probe with stale IDs, so be lenient and fake a success. */
@@ -867,6 +1035,7 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
     fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue=0x%X)\n",
             id, g->cause, g->exit_status, g->event_queue_id);
     fflush(stderr);
+    spu_group_release(g);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -887,21 +1056,34 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
         ctx->gpr[3] = 0;
         return 0;
     }
+    spu_table_lock();
     spu_group_t* g = spu_find_group(id);
+    if (g && (g->state == SPU_GROUP_STATE_RUNNING || g->op_refs)) {
+        spu_table_unlock();
+        return (int64_t)(int32_t)CELL_ESTAT;
+    }
     if (g) {
+        for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
+            uint32_t idx = g->thread_indices[i];
+            if (idx < MAX_SPU_THREADS && s_spu_threads[idx].in_use &&
+                (s_spu_threads[idx].running || s_spu_threads[idx].op_refs)) {
+                spu_table_unlock();
+                return (int64_t)(int32_t)CELL_EBUSY;
+            }
+        }
         for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
             uint32_t idx = g->thread_indices[i];
             if (idx < MAX_SPU_THREADS) {
                 spu_thread_t* t = &s_spu_threads[idx];
-                if (t->local_store) {
-                    free(t->local_store);
-                    t->local_store = NULL;
-                }
+                /* Externally returned LS pointers must remain valid after the
+                 * slot is retired; do not free/reuse this allocation here. */
+                spu_in_mbox_destroy(&t->in_mbox);
                 t->in_use = 0;
             }
         }
         g->in_use = 0;
     }
+    spu_table_unlock();
     fprintf(stderr, "[SPU] group_destroy id=0x%X  caller_lr=0x%08X cia=0x%08X r3..r6=%08X %08X %08X %08X\n",
             id, (uint32_t)ctx->lr, (uint32_t)ctx->cia,
             (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
@@ -916,11 +1098,12 @@ static int64_t sys_spu_thread_group_terminate_handler(ppu_context* ctx)
 {
     uint32_t id     = (uint32_t)ctx->gpr[3];
     int32_t  status = (int32_t)ctx->gpr[4];
-    spu_group_t* g = spu_find_group(id);
+    spu_group_t* g = spu_group_acquire(id);
     if (g) {
         g->state = SPU_GROUP_STATE_STOPPED;
         g->cause = SPU_GROUP_CAUSE_TERMINATED;
         g->exit_status = status;
+        spu_group_release(g);
     }
     fprintf(stderr, "[SPU] group_terminate id=0x%X status=%d\n", id, status);
     fflush(stderr);
@@ -936,7 +1119,7 @@ static int64_t sys_spu_thread_get_exit_status_handler(ppu_context* ctx)
 {
     uint32_t tid       = (uint32_t)ctx->gpr[3];
     uint32_t status_ea = (uint32_t)ctx->gpr[4];
-    spu_thread_t* t = spu_find_thread(tid);
+    spu_thread_t* t = spu_thread_acquire(tid);
     if (!t) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
         return -1;
@@ -945,9 +1128,11 @@ static int64_t sys_spu_thread_get_exit_status_handler(ppu_context* ctx)
         /* Still in flight — Sony's behaviour. Games that want the exit code
          * synchronously should call group_join first. */
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010003; /* CELL_ESTAT */
+        spu_thread_release(t);
         return -1;
     }
     vm_write_be32(status_ea, (uint32_t)t->exit_status);
+    spu_thread_release(t);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -962,14 +1147,32 @@ static int64_t sys_spu_thread_set_argument_handler(ppu_context* ctx)
      * picks it up at sys_spu_thread_group_start time. The shape of the
      * struct at arg_ea is whatever the game registered for — typically
      * a packed (arg1,arg2,arg3,arg4) tuple of 4 u64s on real SPUs. */
-    spu_thread_t* t = spu_find_thread(tid);
-    if (t) t->args_ea = arg_ea;
+    spu_thread_t* t = spu_thread_acquire(tid);
+    if (t) { t->args_ea = arg_ea; spu_thread_release(t); }
 
     fprintf(stderr, "[SPU] thread_set_argument tid=0x%X arg=0x%08X\n",
             tid, arg_ea);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
+}
+
+/* sys_spu_thread_write_spu_mb(tid, value).  The LV2 thread owns a persistent
+ * four-word FIFO; producers block on full and the SPU rdch consumer wakes one. */
+static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint32_t value = (uint32_t)ctx->gpr[4];
+    spu_thread_t* t = spu_thread_acquire(tid);
+    if (!t) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+
+    spu_in_mbox_write(&t->in_mbox, value);
+    spu_thread_release(t);
+    ctx->gpr[3] = CELL_OK;
+    return CELL_OK;
 }
 
 /* sys_spu_thread_group_connect_event(group_id, queue_id, event_type)
@@ -984,12 +1187,13 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
 {
     uint32_t group_id = (uint32_t)ctx->gpr[3];
     uint32_t queue_id = (uint32_t)ctx->gpr[4];
-    spu_group_t* g = spu_find_group(group_id);
+    spu_group_t* g = spu_group_acquire(group_id);
     if (!g) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
         return -1;
     }
     g->event_queue_id = queue_id;
+    spu_group_release(g);
     fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X\n",
             group_id, queue_id);
     fflush(stderr);
@@ -1000,61 +1204,179 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
 static int64_t sys_spu_thread_group_disconnect_event_handler(ppu_context* ctx)
 {
     uint32_t group_id = (uint32_t)ctx->gpr[3];
-    spu_group_t* g = spu_find_group(group_id);
-    if (g) g->event_queue_id = 0;
+    spu_group_t* g = spu_group_acquire(group_id);
+    if (g) { g->event_queue_id = 0; spu_group_release(g); }
     fprintf(stderr, "[SPU] group_disconnect_event group=0x%X\n", group_id);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
 
-/* sys_spu_thread_connect_event(thread_id, eq_id, et) — bind an SPU thread's
- * interrupt events to a PPU event queue. Previously a no-op stub, so the SPU's
- * outbound interrupt mailbox had nowhere to deliver and PPU waiters on q=1/q=4
- * (cellSpurs SpursHdlr / AsyncLoad) blocked forever. Record the binding here;
- * the mailbox-delivery hook (below) uses it. */
+/* Bind a single SPU user-event port to a live PPU event queue. */
 static int64_t sys_spu_thread_connect_event_handler(ppu_context* ctx)
 {
     uint32_t tid = (uint32_t)ctx->gpr[3];
     uint32_t eq  = (uint32_t)ctx->gpr[4];
     uint32_t et  = (uint32_t)ctx->gpr[5];
-    spu_thread_t* t = spu_find_thread(tid);
-    if (t) { t->connected_queue = eq; t->connect_spup = et; }
-    fprintf(stderr, "[SPU] thread_connect_event tid=0x%X queue=0x%X et=0x%X%s\n",
-            tid, eq, et, t ? "" : " (thread not found)");
-    fflush(stderr);
-    ctx->gpr[3] = 0;
-    return 0;
+    uint32_t spup = (uint32_t)ctx->gpr[6];
+    uint32_t eq_generation = sys_event_queue_generation(eq);
+    spu_thread_t* t = spu_thread_acquire(tid);
+    if (!t || !eq_generation) {
+        spu_thread_release(t);
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    if (et != SYS_SPU_THREAD_EVENT_USER || spup >= 64) {
+        spu_thread_release(t);
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+    spu_table_lock();
+    if (t->event_queue_by_spup[spup].id) {
+        spu_table_unlock();
+        spu_thread_release(t);
+        return (int64_t)(int32_t)CELL_EISCONN;
+    }
+    t->event_queue_by_spup[spup].id = eq;
+    t->event_queue_by_spup[spup].generation = eq_generation;
+    spu_table_unlock();
+    spu_thread_release(t);
+    return CELL_OK;
+}
+
+static int64_t sys_spu_thread_disconnect_event_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint32_t et = (uint32_t)ctx->gpr[4];
+    uint32_t spup = (uint32_t)ctx->gpr[5];
+    spu_thread_t* t = spu_thread_acquire(tid);
+    if (!t) return (int64_t)(int32_t)CELL_ESRCH;
+    if (et != SYS_SPU_THREAD_EVENT_USER || spup >= 64) {
+        spu_thread_release(t);
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+    spu_table_lock();
+    if (!t->event_queue_by_spup[spup].id) {
+        spu_table_unlock();
+        spu_thread_release(t);
+        return (int64_t)(int32_t)CELL_ENOTCONN;
+    }
+    t->event_queue_by_spup[spup].id = 0;
+    t->event_queue_by_spup[spup].generation = 0;
+    spu_table_unlock();
+    spu_thread_release(t);
+    return CELL_OK;
+}
+
+/* Choose one requested free SPU user port, bind it on every initialized group
+ * member, then return that port through the guest u8 output. */
+static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_context* ctx)
+{
+    uint32_t group_id = (uint32_t)ctx->gpr[3];
+    uint32_t eq = (uint32_t)ctx->gpr[4];
+    uint64_t req = ctx->gpr[5];
+    uint32_t spup_ea = (uint32_t)ctx->gpr[6];
+    uint32_t eq_generation = sys_event_queue_generation(eq);
+    if (!req) return (int64_t)(int32_t)CELL_EINVAL;
+    if (!vm_guest_writable_range(spup_ea, 1)) return (int64_t)(int32_t)CELL_EFAULT;
+    spu_table_lock();
+    spu_group_t* g = spu_group_acquire(group_id);
+    if (!g || !eq_generation) {
+        spu_table_unlock();
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    if (g->state == SPU_GROUP_STATE_DESTROYED) {
+        spu_table_unlock();
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+
+    uint32_t selected = 64;
+    for (uint32_t spup = 0; spup < 64; spup++) {
+        if (!(req & (UINT64_C(1) << spup))) continue;
+        int free_on_all = 1;
+        for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
+            uint32_t idx = g->thread_indices[i];
+            if (idx >= MAX_SPU_THREADS) continue;
+            spu_thread_t* t = &s_spu_threads[idx];
+            if (t->in_use && t->group_id == group_id && t->event_queue_by_spup[spup].id) {
+                free_on_all = 0;
+                break;
+            }
+        }
+        if (free_on_all) { selected = spup; break; }
+    }
+    if (selected == 64) {
+        spu_table_unlock();
+        return (int64_t)(int32_t)CELL_EISCONN;
+    }
+
+    for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
+        uint32_t idx = g->thread_indices[i];
+        if (idx >= MAX_SPU_THREADS) continue;
+        spu_thread_t* t = &s_spu_threads[idx];
+        if (t->in_use && t->group_id == group_id) {
+            t->event_queue_by_spup[selected].id = eq;
+            t->event_queue_by_spup[selected].generation = eq_generation;
+        }
+    }
+    vm_base[spup_ea] = (uint8_t)selected;
+    spu_table_unlock();
+    return CELL_OK;
+}
+
+static int64_t sys_spu_thread_group_disconnect_event_all_threads_handler(ppu_context* ctx)
+{
+    uint32_t group_id = (uint32_t)ctx->gpr[3];
+    uint32_t spup = (uint32_t)ctx->gpr[4];
+    if (spup >= 64) return (int64_t)(int32_t)CELL_EINVAL;
+    spu_table_lock();
+    spu_group_t* g = spu_group_acquire(group_id);
+    if (!g) {
+        spu_table_unlock();
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
+        uint32_t idx = g->thread_indices[i];
+        if (idx >= MAX_SPU_THREADS) continue;
+        spu_thread_t* t = &s_spu_threads[idx];
+        if (t->in_use && t->group_id == group_id) {
+            t->event_queue_by_spup[spup].id = 0;
+            t->event_queue_by_spup[spup].generation = 0;
+        }
+    }
+    spu_table_unlock();
+    return CELL_OK;
 }
 
 /* SPU -> PPU outbound mailbox delivery. Installed into spu_channels.c's
  * g_spu_out_mbox_hook; called when a (kernel/policy/task) SPU thread writes
  * WrOutMbox/WrOutIntrMbox. Route the value to the event queue bound to the SPU
- * thread (via connect_event) or its group, so a blocked PPU SpursHdlr/AsyncLoad
- * receive wakes. The event carries the mbox value in data1 so the handler can
- * dispatch on it. Only the interrupt mailbox (is_intr) raises a PPU event on
- * real hardware; the plain mailbox is PPU-polled, but we deliver both as events
- * here (harmless: a handler that doesn't expect data ignores it) gated so we
- * don't flood. */
+ * thread (via connect_event), so a blocked PPU receive wakes.  Only the
+ * interrupt mailbox calls this hook; the tuple follows LV2 user-event ABI. */
 extern int sys_event_queue_push_by_id(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
-static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
-                                      int is_intr, uint32_t value)
+static int ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
+                                     uint32_t spup, uint32_t command,
+                                     uint32_t out_mbox_value)
 {
-    /* Find the queue: prefer the per-thread connect_event binding; fall back to
-     * the group's connected queue. */
-    uint32_t q = 0;
-    spu_thread_t* t = spu_find_thread(spu_id);
-    if (t && t->connected_queue) q = t->connected_queue;
-    if (!q) { spu_group_t* g = spu_find_group(group_id); if (g) q = g->event_queue_id; }
-    if (!q) return;
-    /* SPURS SPU-event source convention: high word tags it as an SPU thread
-     * event; data1 = the mailbox value. */
-    sys_event_queue_push_by_id(q,
-        ((uint64_t)spu_id << 32) | (is_intr ? 0x2u : 0x1u),
-        (uint64_t)value, 0, 0);
+    /* Plain WrOutMbox only latches.  WrOutIntrMbox provides this exact spup. */
+    spu_event_binding_t binding = {0, 0};
+    spu_thread_t* t = spu_thread_acquire(spu_id);
+    spu_table_lock();
+    if (t && spup < 64) binding = t->event_queue_by_spup[spup];
+    spu_table_unlock();
+    spu_thread_release(t);
+    if (!binding.id) return (int)CELL_ENOTCONN;
+    int rc = sys_event_queue_push_by_handle(binding.id, binding.generation,
+                                            0xFFFFFFFF53505501ull,
+                                            spu_id,
+                                            ((uint64_t)spup << 32) | command,
+                                            out_mbox_value);
+    /* -2 is the sole retryable result (queue full). Stale id/generation and
+     * all other delivery failures are an unconnected SPU event port. */
+    if (rc == -2) return -2;
+    if (rc) return (int)CELL_ENOTCONN;
     { static int s_w = 0; if (s_w++ < 32)
-        fprintf(stderr, "[SPU->PPU] mbox deliver spu=0x%X intr=%d val=0x%08X -> q=%u\n",
-                spu_id, is_intr, value, q); }
+        fprintf(stderr, "[SPU->PPU] event spu=0x%X spup=%u cmd=0x%06X out=0x%08X -> q=%u\n",
+                spu_id, spup, command, out_mbox_value, binding.id); }
+    return CELL_OK;
 }
 
 /* SPU virtual local store. Real hardware: 256 KB per SPU. We allocate on
@@ -1081,18 +1403,20 @@ static int64_t sys_spu_thread_write_ls_handler(ppu_context* ctx)
     uint32_t ls_offset = (uint32_t)ctx->gpr[4];
     uint64_t value     = (uint64_t)ctx->gpr[5];
     uint32_t type      = (uint32_t)ctx->gpr[6];
-    spu_thread_t* t = spu_find_thread(tid);
+    spu_thread_t* t = spu_thread_acquire(tid);
     if (!t) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
         return -1;
     }
     if (ls_offset + type > SPU_LS_SIZE) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002; /* CELL_EFAULT */
+        spu_thread_release(t);
         return -1;
     }
     uint8_t* ls = spu_thread_get_or_alloc_ls(t);
     if (!ls) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010004; /* CELL_ENOMEM */
+        spu_thread_release(t);
         return -1;
     }
     /* Big-endian store, mirroring guest convention. */
@@ -1108,8 +1432,10 @@ static int64_t sys_spu_thread_write_ls_handler(ppu_context* ctx)
             break;
     default:
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
+        spu_thread_release(t);
         return -1;
     }
+    spu_thread_release(t);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -1122,18 +1448,21 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
     uint32_t ls_offset = (uint32_t)ctx->gpr[4];
     uint32_t value_ea  = (uint32_t)ctx->gpr[5];
     uint32_t type      = (uint32_t)ctx->gpr[6];
-    spu_thread_t* t = spu_find_thread(tid);
+    spu_thread_t* t = spu_thread_acquire(tid);
     if (!t || !value_ea || !vm_base) {
+        spu_thread_release(t);
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
         return -1;
     }
     if (ls_offset + type > SPU_LS_SIZE) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
+        spu_thread_release(t);
         return -1;
     }
     uint8_t* ls = spu_thread_get_or_alloc_ls(t);
     if (!ls) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010004;
+        spu_thread_release(t);
         return -1;
     }
     /* Big-endian load → write to guest as 8 bytes (always); the syscall
@@ -1153,12 +1482,14 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
         break;
     default:
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
+        spu_thread_release(t);
         return -1;
     }
     /* Write 8-byte BE value to guest. */
     uint8_t* p = vm_base + value_ea;
     for (int i = 0; i < 8; i++)
         p[i] = (uint8_t)(value >> ((7-i)*8));
+    spu_thread_release(t);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -1167,7 +1498,26 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
  * PPU-fallback handlers). Allocates on demand. */
 uint8_t* spu_thread_get_local_store(uint32_t tid)
 {
-    return spu_thread_get_or_alloc_ls(spu_find_thread(tid));
+    spu_thread_t* t = spu_thread_acquire(tid);
+    uint8_t* ls = spu_thread_get_or_alloc_ls(t);
+    spu_thread_release(t);
+    return ls;
+}
+
+/* Registered lifted fallback entry. The mailbox remains table-private: callers
+ * identify a tid, then this layer aliases the exact persistent FIFO. */
+int32_t spu_run_lifted_fallback_for_thread(uint32_t tid,
+                                           spu_lifted_entry_fn entry,
+                                           uint32_t args_ea)
+{
+    spu_thread_t* t = spu_thread_acquire(tid);
+    if (!t) return -1;
+    if (!entry) { spu_thread_release(t); return -1; }
+    int32_t rc = spu_run_lifted_job_with_inbox(entry,
+                                                spu_thread_get_or_alloc_ls(t),
+                                                args_ea, &t->in_mbox);
+    spu_thread_release(t);
+    return rc;
 }
 
 uint32_t spu_thread_local_store_size(void) { return SPU_LS_SIZE; }
@@ -1425,6 +1775,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     /* Timer and time (registered before events so event handlers
      * override the conflicting syscall numbers 141, 142, 145) */
     sys_timer_init(tbl);
+    lv2_syscall_register(tbl, SYS_TIME_GET_TIMEZONE, sys_time_get_timezone_handler);
 
     /* Event queues, ports, and flags */
     sys_event_init(tbl);
@@ -1435,6 +1786,9 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 
     /* Filesystem */
     sys_fs_init(tbl);
+
+    /* Retail GPIO reads return a deterministic zero value. */
+    sys_gpio_init(tbl);
 
     /* TTY (debug console I/O — used by CRT startup) */
     lv2_syscall_register(tbl, SYS_TTY_READ,  sys_tty_read);
@@ -1467,10 +1821,11 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_INITIALIZE,      sys_spu_thread_initialize_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_SET_ARGUMENT,    sys_spu_thread_set_argument_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GET_EXIT_STATUS, sys_spu_thread_get_exit_status_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SPU_MB,    sys_spu_thread_write_spu_mb_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_CONNECT_EVENT,   sys_spu_thread_connect_event_handler);
-    { extern void (*g_spu_out_mbox_hook)(uint32_t,uint32_t,int,uint32_t);
+    { extern int (*g_spu_out_mbox_hook)(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
       g_spu_out_mbox_hook = ydkj_spu_out_mbox_deliver; }
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_DISCONNECT_EVENT,sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_DISCONNECT_EVENT,sys_spu_thread_disconnect_event_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT, sys_spu_thread_group_connect_event_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT, sys_spu_thread_group_disconnect_event_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_LS,        sys_spu_thread_write_ls_handler);
@@ -1478,7 +1833,10 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SNR,       sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS,
+                         sys_spu_thread_group_connect_event_all_threads_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT_ALL_THREADS,
+                         sys_spu_thread_group_disconnect_event_all_threads_handler);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1540,7 +1898,9 @@ int lv2_try_syscall(ppu_context* ctx)
      * why libsre asserts ESRCH in event_helper.c. Snapshot args BEFORE handler. */
     uint32_t _a3 = (uint32_t)ctx->gpr[3], _a4 = (uint32_t)ctx->gpr[4], _a5 = (uint32_t)ctx->gpr[5];
     ctx->gpr[3] = (uint64_t)h(ctx);
-    if (getenv("YDKJ_GFXSCAN") && num >= 128 && num <= 141) {
+    static _Thread_local int gfx_scan_enabled = -1;
+    if (gfx_scan_enabled < 0) gfx_scan_enabled = getenv("YDKJ_GFXSCAN") != NULL;
+    if (gfx_scan_enabled && num >= 128 && num <= 141) {
         static int _e = 0; if (_e++ < 60)
             fprintf(stderr, "[EVT-SC] #%u(r3=0x%08X r4=0x%08X r5=0x%08X) -> 0x%08X lr=0x%08X\n",
                     num, _a3, _a4, _a5, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);

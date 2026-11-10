@@ -9,6 +9,13 @@
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
 #include <stdlib.h>               /* getenv */
+static int tj_env_ydkj_waitbt(void){ static int c = -1; if (c < 0) c = getenv("YDKJ_WAITBT") != NULL; return c; }
+static int tj_env_ydkj_sputask(void){ static int c = -1; if (c < 0) c = getenv("YDKJ_SPUTASK") != NULL; return c; }
+static int tj_env_ydkj_spurs_ready(void){ static int c = -1; if (c < 0) c = getenv("YDKJ_SPURS_READY") != NULL; return c; }
+static int tj_env_ydkj_fakecomplete(void){ static int c = -1; if (c < 0) c = getenv("YDKJ_FAKECOMPLETE") != NULL; return c; }
+static int tj_env_ydkj_hle_draw(void){ static int c = -1; if (c < 0) c = getenv("YDKJ_HLE_DRAW") != NULL; return c; }
+static int tj_env_ydkj_q23stack(void){ static int c = -1; if (c < 0) c = getenv("YDKJ_Q23STACK") != NULL; return c; }
+static int tj_env_rd_recv(void){ static int c = -1; if (c < 0) c = getenv("RD_RECV") != NULL; return c; }
 
 /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
  * context EA the title's SPU task runtime is dispatched against. */
@@ -22,6 +29,14 @@ void (*g_spurs_kernel_hook)(uint32_t) = 0;
 sys_event_queue_info g_sys_event_queues[SYS_EVENT_QUEUE_MAX];
 sys_event_port_info  g_sys_event_ports[SYS_EVENT_PORT_MAX];
 sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
+static uint32_t s_evt_next_generation = 1;
+
+static int event_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("PS3_EVENT_TRACE") ? 1 : 0;
+    return enabled;
+}
 
 /* Table lock for allocation */
 #ifdef _WIN32
@@ -105,7 +120,7 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 
     int slot = -1;
     for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
-        if (!g_sys_event_queues[i].active) { slot = i; break; }
+        if (!g_sys_event_queues[i].active && !g_sys_event_queues[i].destroying) { slot = i; break; }
     }
     if (slot < 0) {
         evt_table_unlock();
@@ -115,6 +130,8 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     sys_event_queue_info* q = &g_sys_event_queues[slot];
     memset(q, 0, sizeof(*q));
     q->active   = 1;
+    q->generation = s_evt_next_generation++;
+    if (!q->generation) q->generation = s_evt_next_generation++;
     q->key      = key;
     q->capacity = size;
     q->head     = 0;
@@ -148,9 +165,11 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 #ifdef _WIN32
     InitializeCriticalSection(&q->lock);
     InitializeConditionVariable(&q->not_empty);
+    InitializeConditionVariable(&q->no_receivers);
 #else
     pthread_mutex_init(&q->lock, NULL);
     pthread_cond_init(&q->not_empty, NULL);
+    pthread_cond_init(&q->no_receivers, NULL);
 #endif
 
     uint32_t queue_id = (uint32_t)(slot + 1);
@@ -160,6 +179,39 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 
     evt_table_unlock();
     return CELL_OK;
+}
+
+/* Lock order is event-table -> queue. A receiver first pins the slot under
+ * the table lock, then may block only on the queue lock; destroy marks it
+ * inactive, wakes it, and waits for that pin before deleting primitives. */
+static sys_event_queue_info* event_queue_acquire_receiver(uint32_t queue_id)
+{
+    sys_event_queue_info* q = NULL;
+    if (!queue_id || queue_id > SYS_EVENT_QUEUE_MAX) return NULL;
+    evt_table_lock();
+    q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active || q->destroying) q = NULL;
+    else q->receiver_refs++;
+    evt_table_unlock();
+    return q;
+}
+
+static void event_queue_release_receiver(sys_event_queue_info* q)
+{
+    if (!q) return;
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    if (q->receiver_refs) q->receiver_refs--;
+    if (q->destroying && !q->receiver_refs)
+        WakeAllConditionVariable(&q->no_receivers);
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+    if (q->receiver_refs) q->receiver_refs--;
+    if (q->destroying && !q->receiver_refs)
+        pthread_cond_broadcast(&q->no_receivers);
+    pthread_mutex_unlock(&q->lock);
+#endif
 }
 
 int64_t sys_event_queue_destroy(ppu_context* ctx)
@@ -177,14 +229,29 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
         return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
     }
 
+    q->active = 0;
+    q->destroying = 1;
 #ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    WakeAllConditionVariable(&q->not_empty);
+    evt_table_unlock();
+    while (q->receiver_refs)
+        SleepConditionVariableCS(&q->no_receivers, &q->lock, INFINITE);
+    LeaveCriticalSection(&q->lock);
     DeleteCriticalSection(&q->lock);
 #else
+    pthread_mutex_lock(&q->lock);
+    pthread_cond_broadcast(&q->not_empty);
+    evt_table_unlock();
+    while (q->receiver_refs)
+        pthread_cond_wait(&q->no_receivers, &q->lock);
+    pthread_mutex_unlock(&q->lock);
+    pthread_cond_destroy(&q->no_receivers);
     pthread_cond_destroy(&q->not_empty);
     pthread_mutex_destroy(&q->lock);
 #endif
-
-    q->active = 0;
+    evt_table_lock();
+    memset(q, 0, sizeof(*q));
     evt_table_unlock();
     return CELL_OK;
 }
@@ -204,14 +271,14 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* YDKJ_THREADGATE: the creating thread is now blocking -> workers may run
      * (PS3 priority semantics). Their job objects are fully initialized by now. */
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
-    if (ps3_log_verbose())
+    if (event_trace_enabled())
         fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
                 queue_id, (unsigned long long)timeout_us,
                 (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
 
     /* YDKJ_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
      * exact game function the main thread is stuck polling in the flip loop. */
-    if (getenv("YDKJ_WAITBT")) {
+    if (tj_env_ydkj_waitbt()) {
         static unsigned char seen[8][8] = {{0}};
         unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
         if (!seen[t][qk]) {
@@ -225,8 +292,8 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active)
+    sys_event_queue_info* q = event_queue_acquire_receiver(queue_id);
+    if (!q)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     /* SPURS bring-up: when a PPU thread is about to block forever for SPU
@@ -235,7 +302,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * 0x004F5F80) against the recorded SPURS context. It claims the ready task
      * from libsre's taskset and runs the task body -- real recompiled SPU code,
      * not a synthesized completion. Gated by YDKJ_SPUTASK; fire once. */
-    if (getenv("YDKJ_SPUTASK") && timeout_us == 0 && g_ydkj_spurs_ctx_ea) {
+    if (tj_env_ydkj_sputask() && timeout_us == 0 && g_ydkj_spurs_ctx_ea) {
         static int s_fired = 0;
         if (!s_fired) {
             s_fired = 1;
@@ -256,7 +323,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * returns. Synthesize a ready event so init returns -> see whether the PPU
      * then reaches CreateTaskset and the running policy dispatches the cri task.
      * Returns a zero-ish SPU-thread-group event; refine the format if init rejects it. */
-    if (getenv("YDKJ_SPURS_READY") && (queue_id == 1 || queue_id == 4)
+    if (tj_env_ydkj_spurs_ready() && (queue_id == 1 || queue_id == 4)
             && timeout_us == 0 && q->count == 0) {
         static int s_fire[8] = {0};
         if (s_fire[queue_id] < 64) {
@@ -273,6 +340,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             }
             fprintf(stderr, "[ydkj] SPURS_READY: synthesized ready event on q=%u (#%d)\n",
                     queue_id, s_fire[queue_id]);
+            event_queue_release_receiver(q);
             return CELL_OK;
         }
     }
@@ -282,23 +350,25 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * main thread times out after 30s and the title tears down. Synthesize a
      * completion so the wait returns -> see whether the game then advances to
      * asset load + menu draw (content). Returns immediately with a zero event. */
-    if (getenv("YDKJ_FAKECOMPLETE") && (queue_id == 2 || queue_id == 3) && q->count == 0) {
+    if (tj_env_ydkj_fakecomplete() && (queue_id == 2 || queue_id == 3) && q->count == 0) {
         if (event_addr != 0) {
             uint64_t* out = (uint64_t*)vm_to_host(event_addr);
             out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
         }
+        event_queue_release_receiver(q);
         return CELL_OK;
     }
     /* YDKJ_HLE_DRAW (diagnostic): also unblock the AsyncLoad q=1 wait (timeout=0,
      * blocks forever) so the loader thread proceeds. Tests whether the game's
      * render/draw code is reachable once the completion waits are satisfied. */
-    if (getenv("YDKJ_HLE_DRAW") && queue_id == 1 && timeout_us == 0 && q->count == 0) {
+    if (tj_env_ydkj_hle_draw() && queue_id == 1 && timeout_us == 0 && q->count == 0) {
         static int s_n1 = 0;
         if (s_n1 < 256) { s_n1++;
             if (event_addr != 0) {
                 uint64_t* out = (uint64_t*)vm_to_host(event_addr);
                 out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
             }
+            event_queue_release_receiver(q);
             return CELL_OK;
         }
     }
@@ -313,7 +383,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* Diagnostic: main-thread per-frame poll on q=2/q=3 (timeout ~30us) never
      * advances to content. Dump its guest call chain to identify the frame-loop
      * function + the value it waits on. Fires a few times. YDKJ_Q23STACK. */
-    if ((queue_id == 2 || queue_id == 3) && getenv("YDKJ_Q23STACK")) {
+    if ((queue_id == 2 || queue_id == 3) && tj_env_ydkj_q23stack()) {
 #ifdef _WIN32
         static int _gs23 = 0; if (_gs23++ < 4) {
             void* fr[48]; unsigned short n=RtlCaptureStackBackTrace(0,48,fr,0);
@@ -342,6 +412,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
          * handles, just without the bogus 15ms stall. */
         if (q->count == 0 || !q->active) {
             LeaveCriticalSection(&q->lock);
+            event_queue_release_receiver(q);
             return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
     } else {
@@ -350,6 +421,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     LeaveCriticalSection(&q->lock);
+                    event_queue_release_receiver(q);
                     return (int64_t)(int32_t)CELL_ETIMEDOUT;
                 }
             }
@@ -358,6 +430,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
     if (!q->active || q->count == 0) {
         LeaveCriticalSection(&q->lock);
+        event_queue_release_receiver(q);
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
@@ -386,6 +459,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             int rc = pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
             if (rc == ETIMEDOUT) {
                 pthread_mutex_unlock(&q->lock);
+                event_queue_release_receiver(q);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
         }
@@ -393,6 +467,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
     if (!q->active || q->count == 0) {
         pthread_mutex_unlock(&q->lock);
+        event_queue_release_receiver(q);
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
@@ -414,7 +489,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     ctx->gpr[5] = evt.data1;
     ctx->gpr[6] = evt.data2;
     ctx->gpr[7] = evt.data3;
-    { static int _r=0; if (getenv("RD_RECV") && _r++<60) fprintf(stderr,
+    { static int _r=0; if (tj_env_rd_recv() && _r++<60) fprintf(stderr,
         "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
         (unsigned long long)evt.source, (unsigned long long)evt.data1,
         (unsigned long long)evt.data2); }
@@ -439,6 +514,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
                     (unsigned long long)evt.data3, q->count);
     }
 
+    event_queue_release_receiver(q);
     return CELL_OK;
 }
 
@@ -541,7 +617,7 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 #else
         pthread_mutex_unlock(&q->lock);
 #endif
-        return -1; /* full */
+        return -2; /* full: callers that model producer backpressure retry */
     }
 
     q->buffer[q->tail] = *evt;
@@ -694,14 +770,41 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
                                uint64_t data2,  uint64_t data3)
 {
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return -1;
+    return sys_event_queue_push_by_handle(queue_id,
+                                          sys_event_queue_generation(queue_id),
+                                          source, data1, data2, data3);
+}
+
+uint32_t sys_event_queue_generation(uint32_t queue_id)
+{
+    uint32_t generation = 0;
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return 0;
+    evt_table_lock();
+    if (g_sys_event_queues[queue_id - 1].active)
+        generation = g_sys_event_queues[queue_id - 1].generation;
+    evt_table_unlock();
+    return generation;
+}
+
+int sys_event_queue_push_by_handle(uint32_t queue_id, uint32_t generation,
+                                   uint64_t source, uint64_t data1,
+                                   uint64_t data2, uint64_t data3)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX || !generation) return -1;
+    evt_table_lock();
     sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active) return -1;
+    if (!q->active || q->generation != generation) {
+        evt_table_unlock();
+        return -1;
+    }
     sys_event_t evt;
     evt.source = source;
     evt.data1  = data1;
     evt.data2  = data2;
     evt.data3  = data3;
-    return event_queue_push(q, &evt);
+    int rc = event_queue_push(q, &evt);
+    evt_table_unlock();
+    return rc;
 }
 
 /* Public helper: resolve an event queue by its ipc_key (as registered at
@@ -729,8 +832,9 @@ int64_t sys_event_port_send(ppu_context* ctx)
     if (getenv("YDKJ_NOTIFIER")) { static int _d=0; if(_d++==0){ extern uint32_t vm_read32(uint64_t);
         fprintf(stderr,"[NOTIFIER-ARRAY] @0x587300..0x5873C0 (each obj: +0x0,+0x4,+0x8=portid,+0xC):\n");
         for(uint32_t a=0x587300;a<=0x5873C0;a+=0x10) fprintf(stderr,"  0x%08X: %08X %08X %08X %08X\n",a,vm_read32(a),vm_read32(a+4),vm_read32(a+8),vm_read32(a+0xC)); fflush(stderr); } }
-    fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
-            port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
+    if (event_trace_enabled())
+        fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
+                port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -750,8 +854,9 @@ int64_t sys_event_port_send(ppu_context* ctx)
             sys_event_queue_info* rq = &g_sys_event_queues[port_id - 1];
             sys_event_t revt; revt.source = 0; revt.data1 = data1; revt.data2 = data2; revt.data3 = data3;
             int rc = event_queue_push(rq, &revt);
-            fprintf(stderr, "[evt] port_send(port=%u): port inactive -> ROUTED real event to queue id=%u (data=0x%llX/0x%llX/0x%llX) rc=%d\n",
-                    port_id, port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3, rc);
+            if (event_trace_enabled())
+                fprintf(stderr, "[evt] port_send(port=%u): port inactive -> ROUTED real event to queue id=%u (data=0x%llX/0x%llX/0x%llX) rc=%d\n",
+                        port_id, port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3, rc);
             return (rc < 0) ? (int64_t)(int32_t)CELL_EBUSY : CELL_OK;
         }
         fprintf(stderr, "[evt] port_send(port=%u): port NOT ACTIVE\n", port_id);
@@ -762,8 +867,9 @@ int64_t sys_event_port_send(ppu_context* ctx)
         fprintf(stderr, "[evt] port_send(port=%u): NOT CONNECTED to any queue\n", port_id);
         return (int64_t)(int32_t)CELL_ENOTCONN;
     }
-    fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
-            port_id, p->connected_queue, (unsigned long long)p->name);
+    if (event_trace_enabled())
+        fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
+                port_id, p->connected_queue, (unsigned long long)p->name);
 
     int32_t qidx = p->connected_queue;
     if (qidx <= 0 || qidx > SYS_EVENT_QUEUE_MAX)

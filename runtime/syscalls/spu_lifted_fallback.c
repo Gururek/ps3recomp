@@ -14,13 +14,17 @@
 #include "../spu/spu_lifted_job.h"
 #include <stdint.h>
 
-/* defined in lv2_register.c — the SPU thread's 256 KB local store */
-extern uint8_t* spu_thread_get_local_store(uint32_t tid);
+/* Defined in lv2_register.c. Keeps the persistent LV2 inbox private to the
+ * thread table while this registered fallback aliases it during execution. */
+extern int32_t spu_run_lifted_fallback_for_thread(uint32_t tid,
+                                                  spu_lifted_entry_fn entry,
+                                                  uint32_t args_ea);
 
 int32_t spu_lifted_fallback(uint32_t tid, uint32_t args_ea,
                             uint32_t args_size, void* user)
 {
     (void)args_size;
-    return spu_run_lifted_job((spu_lifted_entry_fn)user,
-                              spu_thread_get_local_store(tid), args_ea);
+    return spu_run_lifted_fallback_for_thread(tid,
+                                               (spu_lifted_entry_fn)user,
+                                               args_ea);
 }

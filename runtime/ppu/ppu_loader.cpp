@@ -19,6 +19,7 @@
  */
 
 #include "ppu_recomp.h"     /* ppu_context, func decls, ppu_recomp_register */
+#include "ppu_thread_exit_signal.h"
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 #include <stdint.h>
 #include <stdio.h>
@@ -30,6 +31,10 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 
 extern "C" uint8_t* vm_base;   /* defined by the host */
 extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below) */
+
+/* LV2 syscall 42.  Keep this local: lv2_syscall_table.h also defines an inline
+ * lv2_syscall wrapper, while this boot harness owns the profiled dispatcher. */
+static constexpr uint64_t SYS_PPU_THREAD_EXIT = 42;
 
 /* ---------------------------------------------------------------------------
  * lwarx/stwcx. cross-thread reservation invalidation.
@@ -69,32 +74,138 @@ static volatile long g_resv_ctx_n = 0;
  * contention (which is inherent) still serializes on one slot. */
 #define PPU_RESV_LOCKS 1024
 static volatile long g_resv_locks[PPU_RESV_LOCKS];
-/* PPU_RESV_STORE=1 -> also invalidate reservations on PLAIN stores (vm_write32/64)
+/* PPU_RESV_STORE=1 -> also invalidate reservations on PLAIN stores (vm_write*)
  * to a reserved word, matching real PPC (any store to the reservation granule
  * kills it). stwcx-break alone covers stwcx-vs-stwcx ABA, but a value that returns
  * to its old bits via NON-stwcx writes slips past it; this closes that window.
  * vm_write* reads g_resv_store_active directly (a hot global) so the default-off
- * path costs one predictable branch. */
-extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
+ * path costs one predictable branch. Bit0 enables invalidation; bit1 enables
+ * observation only. A write-watch must not silently change guest reservations. */
+extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, bit0 invalidate, bit1 watch */
+extern "C" uint64_t ppu_wwatch_word = UINT64_MAX;
+static void ppu_wwatch_ensure_target(void);
+static int vm_oob(uint32_t a, uint32_t n);
+/* Loader workers register concurrently.  Publish the environment result once
+ * before any plain-store hook can use it. */
+#ifdef _WIN32
+static INIT_ONCE g_resv_store_init_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK ppu_resv_init_store_active(PINIT_ONCE, PVOID, PVOID*)
+{
+    g_resv_store_active = (getenv("PPU_RESV_STORE") ? 1 : 0) |
+                          (getenv("YDKJ_WWATCH") ? 2 : 0);
+    return TRUE;
+}
+static void ppu_resv_ensure_store_active(void)
+{
+    InitOnceExecuteOnce(&g_resv_store_init_once, ppu_resv_init_store_active, NULL, NULL);
+}
+#else
+static void ppu_resv_ensure_store_active(void)
+{
+    if (g_resv_store_active < 0)
+        g_resv_store_active = (getenv("PPU_RESV_STORE") ? 1 : 0) |
+                              (getenv("YDKJ_WWATCH") ? 2 : 0);
+}
+#endif
 extern "C" void ppu_resv_register(ppu_context* c)
 {
-    if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
+    ppu_resv_ensure_store_active();
+    /* Publish the shared diagnostic target before generated fast stores run. */
+    ppu_wwatch_ensure_target();
     long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
     if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
 }
-/* Break every reservation on ea's word (real-PPC granule semantics on a store).
+/* Break every reservation word overlapping a plain store's exact byte range.
  * Best-effort/unlocked: the break is a single word write; a concurrent stwcx
  * recheck reads reserve_addr under its slot lock and the value-CAS backstops the
  * narrow race. Skips already-invalid slots. */
-extern "C" void ppu_resv_break_store(uint64_t ea)
+#ifdef _WIN32
+static int64_t g_iwwatch_ea = -1;
+static INIT_ONCE g_iwwatch_init_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK ppu_resv_iwwatch_init(PINIT_ONCE, PVOID, PVOID*)
 {
-    uint32_t a = (uint32_t)ea & ~3u;
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
-    for (long i = 0; i < n; i++) {
-        ppu_context* c = g_resv_ctxs[i];
-        if (c && c->reserve_addr < PPU_RESV_INVALID && ((uint32_t)c->reserve_addr & ~3u) == a)
-            c->reserve_addr = PPU_RESV_INVALID;
+    const char* value = getenv("YDKJ_WWATCH");
+    g_iwwatch_ea = value ? (int64_t)strtoul(value, NULL, 0) : -1;
+    ppu_wwatch_word = g_iwwatch_ea < 0 ? UINT64_MAX : ((uint32_t)g_iwwatch_ea & ~3u);
+    return TRUE;
+}
+#endif
+static void ppu_wwatch_ensure_target(void)
+{
+#ifdef _WIN32
+    InitOnceExecuteOnce(&g_iwwatch_init_once, ppu_resv_iwwatch_init, NULL, NULL);
+#endif
+}
+static void ppu_resv_iwwatch(uint64_t store_ea, uint32_t width)
+{
+#ifdef _WIN32
+    static LONG logged = 0;
+    InitOnceExecuteOnce(&g_iwwatch_init_once, ppu_resv_iwwatch_init, NULL, NULL);
+    if (g_iwwatch_ea < 0) return;
+
+    uint32_t watched_ea = (uint32_t)g_iwwatch_ea;
+    uint32_t watched_word = watched_ea & ~3u;
+    uint64_t store_end = store_ea + (uint64_t)width;
+    if (store_end < store_ea ||
+        store_end <= watched_word || store_ea >= (uint64_t)watched_word + sizeof(uint32_t) ||
+        vm_oob(watched_word, sizeof(uint32_t)) ||
+        InterlockedIncrement(&logged) > 200)
+        return;
+
+    LONG current_raw = InterlockedCompareExchange(
+        reinterpret_cast<volatile LONG*>(vm_base + watched_word), 0, 0);
+    uint32_t current = __builtin_bswap32((uint32_t)current_raw);
+    uint64_t tid = g_active_ctx ? g_active_ctx->thread_id : 0;
+    uint32_t cia = g_active_ctx ? (uint32_t)g_active_ctx->cia : 0;
+    uint32_t lr = g_active_ctx ? (uint32_t)g_active_ctx->lr : 0;
+    void* bt[24];
+    unsigned short frames = RtlCaptureStackBackTrace(0, 24, bt, NULL);
+    char line[900];
+    int used = snprintf(line, sizeof(line),
+                        "[IWWATCH] store=0x%08X width=%u watch=0x%08X value=0x%08X "
+                        "tid=%llu cia=0x%08X lr=0x%08X guest:",
+                        (uint32_t)store_ea, width, watched_ea, current,
+                        (unsigned long long)tid, cia, lr);
+    for (unsigned short i = 0; i < frames && i < 10 && used < (int)sizeof(line); i++) {
+        uintptr_t target = (uintptr_t)bt[i];
+        uint32_t guest = 0;
+        uintptr_t host = 0;
+        for (uint64_t k = 0; k < function_table_count; k++) {
+            uintptr_t candidate = (uintptr_t)function_table[k].func;
+            if (candidate <= target && candidate > host) {
+                host = candidate;
+                guest = function_table[k].addr;
+            }
+        }
+        if (guest && target - host < 0x1400)
+            used += snprintf(line + used, sizeof(line) - used,
+                             " func_%08X+0x%llX", guest,
+                             (unsigned long long)(target - host));
     }
+    fprintf(stderr, "%s\n", line);
+#else
+    (void)store_ea; (void)width;
+#endif
+}
+
+extern "C" void ppu_resv_break_store(uint64_t ea, uint32_t width)
+{
+    /* Invalidate every reservation word overlapping [ea, ea + width), not
+     * merely the word holding the first byte.  64-bit arithmetic keeps the
+     * upper guest boundary from wrapping into address zero. */
+    uint64_t store_end = ea + (uint64_t)width;
+    if (!width || store_end < ea) return;
+    if (g_resv_store_active & 1) {
+        long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+        for (long i = 0; i < n; i++) {
+            ppu_context* c = g_resv_ctxs[i];
+            uint64_t reservation_word = c ? ((uint32_t)c->reserve_addr & ~3u) : 0;
+            if (c && c->reserve_addr < PPU_RESV_INVALID &&
+                reservation_word + sizeof(uint32_t) > ea && reservation_word < store_end)
+                c->reserve_addr = PPU_RESV_INVALID;
+        }
+    }
+    ppu_resv_iwwatch(ea, width);
 }
 static inline volatile long* resv_slot(uint64_t ea) { return &g_resv_locks[((uint32_t)ea >> 4) & (PPU_RESV_LOCKS - 1)]; }
 static inline void resv_lock(volatile long* L)   { while (_InterlockedExchange(L, 1)) { while (*L) YieldProcessor(); } }
@@ -223,8 +334,38 @@ extern "C" uint32_t ppu_vm_size = 0;
  * the free window just below the mmapper region (0x11000000) and above any
  * game's high data segments, so it doesn't collide with the static image. */
 static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
-#define PPU_TLS_IMG   0x10F00000u
-#define PPU_TLS_TP    (PPU_TLS_IMG + 0x7000u)
+static uint32_t g_tls_image = 0x10F00000u;
+static uint32_t g_thread_tls_end = 0x11000000u;
+
+extern "C" void ppu_set_tls_image(uint32_t image_base)
+{
+    g_tls_image = image_base;
+    g_thread_tls_end = image_base + 0x00400000u;
+    fprintf(stderr, "[ppu] default TLS image set to 0x%08X (TP=0x%08X)\n",
+            g_tls_image, g_tls_image + 0x7000u);
+}
+
+static inline uint32_t ppu_tls_tp(void)
+{
+    return g_tls_image + 0x7000u;
+}
+
+static uint32_t ppu_alloc_thread_tls(uint64_t thread_id)
+{
+    /* Thread table IDs are reused after detached workers finish. Reuse and
+     * clear the matching TLS slot too; consuming a fresh slot on every worker
+     * recreation exhausts the pool during the title intro alone. */
+    uint32_t slot = (uint32_t)thread_id;
+    uint32_t block = g_tls_image + slot * 0x10000u;
+    if (block >= g_thread_tls_end || block + 0x10000u > g_thread_tls_end) {
+        fprintf(stderr, "[ppu] TLS slot %u outside pool; using main TLS\n", slot);
+        return ppu_tls_tp();
+    }
+    memset(vm_base + block, 0, 0x10000u);
+    if (g_tls_filesz)
+        memcpy(vm_base + block, vm_base + g_tls_vaddr, g_tls_filesz);
+    return block + 0x7000u;
+}
 
 #ifdef _WIN32
 #include <windows.h>
@@ -508,6 +649,55 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                     a - b, v, width, ppu_prof_resolve_host(ra));
     }
 }
+/* Generated external vm_write* calls do not pass through the inline
+ * reservation hook.  Reuse the exact same once-initialized target, but trace
+ * only stores overlapping its four-byte watched word. */
+static void ppu_wwatch_store(uint64_t store_ea, uint32_t width, uint64_t source_value)
+{
+#ifdef _WIN32
+    static LONG logged = 0;
+    InitOnceExecuteOnce(&g_iwwatch_init_once, ppu_resv_iwwatch_init, NULL, NULL);
+    if (g_iwwatch_ea < 0) return;
+
+    uint32_t watched_ea = (uint32_t)g_iwwatch_ea;
+    uint32_t watched_word = watched_ea & ~3u;
+    uint64_t store_end = store_ea + (uint64_t)width;
+    if (!width || store_end < store_ea ||
+        store_end <= watched_word || store_ea >= (uint64_t)watched_word + sizeof(uint32_t) ||
+        InterlockedIncrement(&logged) > 400)
+        return;
+
+    char* module = (char*)GetModuleHandleA(NULL);
+    void* bt[28];
+    unsigned short frames = RtlCaptureStackBackTrace(0, 28, bt, NULL);
+    char line[1000];
+    int used = snprintf(line, sizeof(line),
+                        "[WWATCH] store=0x%08X width=%u value=0x%llX watch=0x%08X bt:",
+                        (uint32_t)store_ea, width,
+                        (unsigned long long)source_value, watched_ea);
+    if (g_active_ctx) {
+        used += snprintf(line + used, sizeof(line) - used,
+                         " {lr=%08X tid=%llu r3=%llX r9=%llX r24=%llX r25=%llX r26=%llX r27=%llX r28=%llX r29=%llX}",
+                         (uint32_t)g_active_ctx->lr,
+                         (unsigned long long)g_active_ctx->thread_id,
+                         (unsigned long long)g_active_ctx->gpr[3],
+                         (unsigned long long)g_active_ctx->gpr[9],
+                         (unsigned long long)g_active_ctx->gpr[24],
+                         (unsigned long long)g_active_ctx->gpr[25],
+                         (unsigned long long)g_active_ctx->gpr[26],
+                         (unsigned long long)g_active_ctx->gpr[27],
+                         (unsigned long long)g_active_ctx->gpr[28],
+                         (unsigned long long)g_active_ctx->gpr[29]);
+    }
+    for (unsigned short i = 0; i < frames && used < (int)sizeof(line); i++)
+        used += snprintf(line + used, sizeof(line) - used, " %llX",
+                         (unsigned long long)((char*)bt[i] - module));
+    fprintf(stdout, "%s\n", line);
+    fflush(stdout);
+#else
+    (void)store_ea; (void)width; (void)source_value;
+#endif
+}
 void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1)) return; if (vm_oob((uint32_t)a,1)) return;
 #ifdef _WIN32
     /* FLOW_TRUNC=<hex>: catch the byte-write that clobbers the word currently
@@ -557,34 +747,19 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
         if(nw==(uint32_t)g_pt_val && cur!=(uint32_t)g_pt_val) pt_record(wa);
         else if(((uint32_t)a&3)==0 && v!=0) pt_restore(wa); /* MSB byte set non-zero = restored */ } }
 #endif
-    vm_base[(uint32_t)a] = v; }
+    vm_base[(uint32_t)a] = v;
+    ppu_wwatch_store(a, 1, v); }
 void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2)) return;
-    { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40)
-        fprintf(stderr,"[WWATCH] write16 0x%08X = 0x%04X  ra=%p\n", ea, v, __builtin_return_address(0)); } }
-    v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
+    uint16_t source = v;
+    v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2);
+    ppu_wwatch_store(a, 2, source); }
 void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4)) return;
+    uint32_t source = v;
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
      * previously-truncated slot clears the record (that truncation was transient). */
     if (g_pt_val>=0 && (v>>24)!=0) pt_restore((uint32_t)a);
 #endif
-    { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
-#ifdef _WIN32
-        /* Full host backtrace, not just ra: lifted `bl` is a plain C call, so the
-         * host stack walks through every lifted caller INCLUDING vtable dispatch
-         * (ps3_indirect_call) -- the only way to see past no-xref indirect calls.
-         * Resolve RVAs against the linker map (e.g. lbp/build/lbp_ps3.map). */
-        static int _wn=0; if (_wn++ < 400) {
-        char* mb=(char*)GetModuleHandleA(NULL); void* bt[28]; unsigned short fr=RtlCaptureStackBackTrace(0,28,bt,0);
-        char ln[1000]; int p=snprintf(ln,sizeof ln,"[WWATCH] write32 0x%08X = 0x%08X bt:",ea,v);
-        for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
-        fprintf(stderr,"%s\n",ln); }
-#else
-        fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  ra=%p\n", ea, v, __builtin_return_address(0));
-#endif
-      } } }
 #ifdef _WIN32
     /* FLOW_WVAL=<hex>: catch the instruction that STORES this value to a non-rodata
      * dest (e.g. a metaclass list node corrupted with a format-string pointer). */
@@ -657,12 +832,10 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
         for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
         fprintf(stderr,"%s\n",ln); } } }
 #endif
-    v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4); }
+    v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4);
+    ppu_wwatch_store(a, 4, source); }
 void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return;
-    { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
-        void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(NULL);
-        fprintf(stderr,"[WWATCH] write64 0x%08X = 0x%016llX  ra_rva=0x%llX\n", ea, (unsigned long long)v, (unsigned long long)((char*)ra-mb)); } } }
+    uint64_t source = v;
     /* FLOW_WVAL (64-bit): catch a 64-bit store whose HIGH or LOW 32-bit half equals
      * the watched value — the blind spot for the vm_write32-only FLOW_WVAL hook. */
     { static int64_t wv=-2; if(wv==-2){const char*e=getenv("FLOW_WVAL"); wv=e?(int64_t)strtoul(e,0,16):-1;}
@@ -680,7 +853,8 @@ void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return;
           fprintf(stderr,"%s\n",ln);
 #endif
         } } } }
-    v = __builtin_bswap64(v); memcpy(vm_base + (uint32_t)a, &v, 8); }
+    v = __builtin_bswap64(v); memcpy(vm_base + (uint32_t)a, &v, 8);
+    ppu_wwatch_store(a, 8, source); }
 }
 
 /* ---- malloc allocation tracker (FLOW_ALLOCTAG) -------------------------------
@@ -989,6 +1163,55 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         fprintf(stderr,"[RECVTRACE #%d] indirect-call -> func_00075380 (q=1 receive) r3=0x%08X r4=0x%08X\n",_n,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4]);
         ppu_dump_guest_stack(ctx,"recv-caller"); } } }
     uint32_t addr = (uint32_t)ctx->ctr;
+    /* Tokyo Jungle frame-loop probe.  The main application object is passed as
+     * r3 to its update/render virtual calls.  Trace those targets without
+     * touching generated code so menu and Survival callback sequences can be
+     * compared directly.  TJ_APP_CALL_TRACE is the guest object EA in hex. */
+    {
+        static int64_t app_ea = -2;
+        static uint64_t app_calls = 0;
+        if (app_ea == -2) {
+            const char* e = getenv("TJ_APP_CALL_TRACE");
+            app_ea = e ? (int64_t)strtoul(e, nullptr, 16) : -1;
+        }
+        if (app_ea >= 0 && (uint32_t)ctx->gpr[3] == (uint32_t)app_ea) {
+            const uint64_t n = ++app_calls;
+            if (n <= 30 || (n % 300) == 0) {
+                const uint32_t obj = (uint32_t)app_ea;
+                fprintf(stderr,
+                        "[TJ-APP-CALL] n=%llu target=0x%08X tid=%llu "
+                        "s05=%u s06=%u frame48=0x%08X\n",
+                        (unsigned long long)n, addr,
+                        (unsigned long long)ctx->thread_id,
+                        (unsigned)vm_read8(obj + 5),
+                        (unsigned)vm_read8(obj + 6),
+                        vm_read32(obj + 0x48));
+            }
+        }
+    }
+    /* Generic one-target vcall probe.  Useful for proving whether a state
+     * machine's virtual update method is still scheduled after a scene change. */
+    {
+        static int64_t target_ea = -2;
+        static uint64_t target_calls = 0;
+        if (target_ea == -2) {
+            const char* e = getenv("TJ_TARGET_TRACE");
+            target_ea = e ? (int64_t)strtoul(e, nullptr, 16) : -1;
+        }
+        if (target_ea >= 0 && addr == (uint32_t)target_ea) {
+            const uint64_t n = ++target_calls;
+            if (n <= 20 || (n % 120) == 0) {
+                const uint32_t obj = (uint32_t)ctx->gpr[3];
+                fprintf(stderr,
+                        "[TJ-TARGET-CALL] n=%llu target=0x%08X obj=0x%08X "
+                        "tid=%llu f490=%u f494=%u f498=%u\n",
+                        (unsigned long long)n, addr, obj,
+                        (unsigned long long)ctx->thread_id,
+                        vm_read32(obj + 0x490), vm_read32(obj + 0x494),
+                        vm_read32(obj + 0x498));
+            }
+        }
+    }
     /* PS3_CALLTRACE=N: log the first N indirect calls (target + r3/r4) --
      * generic visibility into vtable/callback dispatch (e.g. which job body a
      * JobManager worker runs). */
@@ -1085,6 +1308,11 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         static int _tf=-1; if(_tf<0)_tf=getenv("FLOW_TOCFIX")?1:0;
         if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
         g_vcall_sp++;
+        struct indirect_call_scope {
+            int& depth;
+            int& vcall_sp;
+            ~indirect_call_scope() { --depth; --vcall_sp; }
+        } cleanup { s_depth, g_vcall_sp };
         fn(ctx);
         while (g_trampoline_fn) {
             void (*tf)(void*) = g_trampoline_fn;
@@ -1092,7 +1320,6 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
             if (_tf) ctx->gpr[2] = _toc0;
             tf(ctx);
         }
-        if (g_vcall_sp > 0) g_vcall_sp--;
         /* FLOW_RETWATCH=<hex>: catch the first vcall(s) whose RETURN value (r3)
          * equals this, pinning the exact virtual method that produces the poison. */
         { static int64_t rw=-2; if(rw==-2){const char*e=getenv("FLOW_RETWATCH"); rw=e?(int64_t)strtoul(e,0,16):-1;}
@@ -1107,7 +1334,6 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
             fprintf(stderr,"%s\n",ln);
 #endif
           } } }
-        s_depth--;
         return;
     }
     /* Garbage virtual-call guard: a call target that resolves to no registered
@@ -1322,6 +1548,32 @@ extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
 /* The real lv2 syscall table (runtime/syscalls/lv2_register.c). */
 extern "C" int lv2_try_syscall(ppu_context* ctx);
 
+/* Display callback safe point shared by HLE calls and raw LV2 syscalls.
+ * A guest completion loop can use only sys_timer_usleep; withholding queued
+ * GPU interrupts until another HLE import then starves its signal producer.
+ * Keep delivery on the main PPU thread and outside any scratch-stack guest
+ * callback. This does not create signals or alter the completion predicate. */
+/* ppu_hle.cpp owns the optional GCM symbol; keep its COFF weak alias in one
+ * translation unit rather than emitting duplicate weak definitions. */
+extern "C" void ppu_dispatch_display_callbacks(void);
+extern "C" unsigned sys_mutex_current_thread_lock_count(void);
+static thread_local unsigned s_guest_callback_depth = 0;
+extern "C" void ppu_guest_callback_enter(void) { ++s_guest_callback_depth; }
+extern "C" void ppu_guest_callback_leave(void) { --s_guest_callback_depth; }
+struct PpuCallbackScope {
+    PpuCallbackScope() { ppu_guest_callback_enter(); }
+    ~PpuCallbackScope() { ppu_guest_callback_leave(); }
+};
+extern "C" void ppu_poll_display_callbacks(ppu_context* ctx)
+{
+    /* An interrupt that borrows the main PPU identity must never re-enter a
+     * held kernel mutex: an unchecked callback lock failure can otherwise
+     * make its unlock release the interrupted caller's lock. */
+    if (ctx && ctx->thread_id == 1 && !s_guest_callback_depth &&
+        !sys_mutex_current_thread_lock_count())
+        ppu_dispatch_display_callbacks();
+}
+
 /* lv2 syscall dispatch: r11 = syscall number, args in r3.. (PPC ABI).
  * A few syscalls the CRT needs at boot are handled inline (boot-tuned); the
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
@@ -1329,12 +1581,15 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
+    ppu_poll_display_callbacks(ctx);
     uint64_t num = ctx->gpr[11];
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
-    if (getenv("YDKJ_SCTRACE"))
+    static thread_local int syscall_trace_enabled = -1;
+    if (syscall_trace_enabled < 0) syscall_trace_enabled = getenv("YDKJ_SCTRACE") != NULL;
+    if (syscall_trace_enabled)
         fprintf(stderr, "[sc] %llu r3=%08X r4=%08X r5=%08X r6=%08X\n",
                 (unsigned long long)num, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
                 (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6]);
@@ -1464,7 +1719,9 @@ extern "C" void lv2_syscall(ppu_context* ctx)
          * rwlock / event / timer / memory / vm / fs / spu). Initialised by
          * lv2_init_syscalls() at boot. Unregistered numbers fall through to the
          * return-0 stub below (which is what got the CRT this far). */
-        if (getenv("YDKJ_BLOCKTRACE")) {
+        static thread_local int block_trace_enabled = -1;
+        if (block_trace_enabled < 0) block_trace_enabled = getenv("YDKJ_BLOCKTRACE") != NULL;
+        if (block_trace_enabled) {
             static ULONGLONG s_acc[1024]={0}; static uint32_t s_cnt[1024]={0}; static ULONGLONG s_win=0;
             uint32_t _a3=(uint32_t)ctx->gpr[3], _a4=(uint32_t)ctx->gpr[4], _a5=(uint32_t)ctx->gpr[5];
             ULONGLONG _t0 = GetTickCount64();
@@ -1488,10 +1745,15 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                     fprintf(stderr,"[BLOCKSUM] syscall %d: %llums total over %u calls (last 2s)\n",n,(unsigned long long)s_acc[n],s_cnt[n]);
                 for (int n=0;n<1024;n++){s_acc[n]=0;s_cnt[n]=0;} s_win=_t0;
             }
-            if (_ok) return;
-        } else {
-            if (lv2_try_syscall(ctx))
+            if (_ok) {
+                if (num == SYS_PPU_THREAD_EXIT) ppu_throw_thread_exit();
                 return;
+            }
+        } else {
+            if (lv2_try_syscall(ctx)) {
+                if (num == SYS_PPU_THREAD_EXIT) ppu_throw_thread_exit();
+                return;
+            }
         }
         static int logged = 0;
         if (logged < 30) {
@@ -1604,16 +1866,31 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
     uint32_t code = 0, toc = 0;
     ppu_opd_resolve((uint32_t)ctx->cia, &code, &toc);
     if (toc) ctx->gpr[2] = toc;
-    if (!ctx->gpr[13]) ctx->gpr[13] = PPU_TLS_TP;   /* share main TLS for now */
+    if (!ctx->gpr[13]) {
+        ctx->gpr[13] = ppu_alloc_thread_tls(ctx->thread_id);
+        fprintf(stderr, "[ppu] thread %llu TLS TP=0x%08X\n",
+                (unsigned long long)ctx->thread_id, (uint32_t)ctx->gpr[13]);
+    }
     ppu_fn fn = ppu_lookup(code);
     if (!fn) {
         fprintf(stderr, "[ppu] thread entry 0x%08X (cia=0x%08X) not registered\n",
                 code, (uint32_t)ctx->cia);
         return;
     }
+    ppu_context* saved_active = g_active_ctx;
     g_active_ctx = ctx;
-    fn(ctx);
-    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(ctx); }
+    try {
+        fn(ctx);
+        while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(ctx); }
+    } catch (const ppu_thread_exit_signal&) {
+        g_trampoline_fn = 0;
+    }
+    g_active_ctx = saved_active;
+}
+
+extern "C" void ppu_install_thread_trampoline(void)
+{
+    g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
 }
 
 /* Call a guest function by OPD with up to 4 integer args, on a private scratch
@@ -1641,6 +1918,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
     if (!opd_addr) return 0;
+    PpuCallbackScope callback_scope;
     uint32_t code = 0, toc = 0;
     ppu_opd_resolve(opd_addr, &code, &toc);
     ppu_fn fn = ppu_lookup(code);
@@ -1664,7 +1942,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
-    ctx.gpr[13] = PPU_TLS_TP;
+    ctx.gpr[13] = ppu_tls_tp();
     ctx.cia     = code;
     /* Save/restore g_active_ctx: this scratch ctx lives on the stack, so leaving
      * g_active_ctx pointing at it after we return leaves a DANGLING pointer once the
@@ -1682,8 +1960,15 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
     ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
 #endif
     g_active_ctx = &ctx;
-    fn(&ctx);
-    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    try {
+        fn(&ctx);
+        while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    } catch (const ppu_thread_exit_signal&) {
+        g_active_ctx = saved_active;
+        if (saved_active) throw;
+        g_trampoline_fn = 0;
+        return ctx.gpr[3];
+    }
     g_active_ctx = saved_active;
     return ctx.gpr[3];
 }
@@ -1697,6 +1982,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
                                       uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
     if (!code) return 0;
+    PpuCallbackScope callback_scope;
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
@@ -1709,7 +1995,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
-    ctx.gpr[13] = PPU_TLS_TP;
+    ctx.gpr[13] = ppu_tls_tp();
     ctx.cia     = code;
     /* Save/restore g_active_ctx (see ppu_guest_call): the scratch ctx is stack-local,
      * so a dangling g_active_ctx after return corrupts the crash handler / diagnostics. */
@@ -1722,8 +2008,15 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
 #endif
     g_active_ctx = &ctx;
-    fn(&ctx);
-    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    try {
+        fn(&ctx);
+        while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    } catch (const ppu_thread_exit_signal&) {
+        g_active_ctx = saved_active;
+        if (saved_active) throw;
+        g_trampoline_fn = 0;
+        return ctx.gpr[3];
+    }
     g_active_ctx = saved_active;
     return ctx.gpr[3];
 }
@@ -1774,12 +2067,13 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     /* Main-thread TLS: copy the PT_TLS template into the TLS image (zeroing the
      * BSS tail) and point r13 at TP. The CRT accesses thread-locals relative to
      * r13; without this they hit address ~0 and corrupt the boot. */
-    if (g_tls_memsz && (PPU_TLS_IMG + g_tls_memsz < (ppu_vm_size ? ppu_vm_size : 0x11000000u))) {
-        memcpy(vm_base + PPU_TLS_IMG, vm_base + g_tls_vaddr, g_tls_filesz);
+    if (g_tls_memsz && (g_tls_image + g_tls_memsz < (ppu_vm_size ? ppu_vm_size : 0x11000000u))) {
+        memcpy(vm_base + g_tls_image, vm_base + g_tls_vaddr, g_tls_filesz);
         if (g_tls_memsz > g_tls_filesz)
-            memset(vm_base + PPU_TLS_IMG + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
-        ctx.gpr[13] = PPU_TLS_TP;
-        fprintf(stderr, "[ppu] TLS image 0x%08X (r13/TP=0x%08X)\n", PPU_TLS_IMG, PPU_TLS_TP);
+            memset(vm_base + g_tls_image + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
+        ctx.gpr[13] = ppu_tls_tp();
+        fprintf(stderr, "[ppu] TLS image 0x%08X (r13/TP=0x%08X)\n",
+                g_tls_image, ppu_tls_tp());
     }
     /* Guest command line (argc/argv). The PS3 LV2 loader passes argv[0] = the boot
      * path; ppu_run previously left r3/r4 zeroed, so the guest read a garbage argv[0]
@@ -1813,10 +2107,16 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
                 str_addr, rb, __builtin_bswap32(*(uint32_t*)(vm_base+argv_base)));
     }
     fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, stack_top);
+    ppu_context* saved_active = g_active_ctx;
     g_active_ctx = &ctx;
     ppu_resv_register(&ctx);   /* main/entry thread: join the reservation set too */
-    fn(&ctx);
-    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    try {
+        fn(&ctx);
+        while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    } catch (const ppu_thread_exit_signal&) {
+        g_trampoline_fn = 0;
+    }
+    g_active_ctx = saved_active;
     return 0;
 }
 

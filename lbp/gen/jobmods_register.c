@@ -371,7 +371,6 @@ void lbp_jobmods_register_all(void)
       spu_overlay_register_sig(sig, 288); }   /* jobmod_fa174fb39387_e1078 entry 0x5078 */
     spu_begin_image(0);
 }
-
 __attribute__((constructor)) static void lbp_jobmods_register_ctor(void)
 {
     lbp_jobmods_register_all();

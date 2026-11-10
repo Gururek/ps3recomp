@@ -181,6 +181,16 @@ s32 sceNpTrophyInit(void* poolPtr, u32 poolSize, u32 containerId, u64 options)
     if (s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED;
 
+    /* TJ_TROPHY_DIR: automated test runs keep their trophies in their own
+     * folder so they never touch the player's trophy file. */
+    {
+        const char* dir = getenv("TJ_TROPHY_DIR");
+        if (dir && *dir) {
+            sceNpTrophySetStoragePath(dir);
+            printf("[sceNpTrophy] storage %s\n", s_storage_path);
+        }
+    }
+
     memset(s_contexts, 0, sizeof(s_contexts));
     memset(s_handles, 0, sizeof(s_handles));
     s_trophy_initialized = 1;
@@ -227,7 +237,7 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
             s_contexts[i].in_use = 1;
             s_contexts[i].commId = *commId_h;
             s_contexts[i].total_trophies = SCE_NP_TROPHY_MAX_NUM_TROPHIES;
-            *context_h = i;
+            *context_h = (SceNpTrophyContext)ps3_bswap32((u32)i);
             printf("[sceNpTrophy] CreateContext(commId=\"%s\") -> ctx=%d\n",
                    commId_h->data, i);
             return CELL_OK;
@@ -266,7 +276,7 @@ s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle)
     for (s32 i = 0; i < SCE_NP_TROPHY_MAX_HANDLES; i++) {
         if (!s_handles[i].in_use) {
             s_handles[i].in_use = 1;
-            *handle = i;
+            *handle = (SceNpTrophyHandle)ps3_bswap32((u32)i);
             printf("[sceNpTrophy] CreateHandle() -> handle=%d\n", i);
             return CELL_OK;
         }
@@ -514,7 +524,9 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
 
     /* Check if all non-platinum trophies are unlocked -> platinum */
     if (platinumId) {
-        *platinumId = SCE_NP_TROPHY_INVALID_TROPHY_ID;
+        SceNpTrophyId* platinum_h = GUEST_PTR(platinumId, SceNpTrophyId*);
+        *platinum_h = (SceNpTrophyId)ps3_bswap32(
+            (u32)SCE_NP_TROPHY_INVALID_TROPHY_ID);
         /* Simplified: don't auto-award platinum without grade info */
     }
 

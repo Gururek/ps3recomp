@@ -7,18 +7,24 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #ifdef _WIN32
   #include <direct.h>
   #include <io.h>
+  #include <sys/utime.h>
+  #include <sys/utime.h>
   #define stat _stat64
   #define S_ISDIR(m) (((m) & _S_IFDIR) != 0)
   #define S_ISREG(m) (((m) & _S_IFREG) != 0)
 #else
   #include <unistd.h>
   #include <dirent.h>
+  #include <utime.h>
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -27,6 +33,132 @@
 sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 char            g_sys_fs_root[512] = ".";
+
+static int sys_fs_readonly(void)
+{
+    static int readonly = -1;
+    if (readonly < 0) readonly = getenv("PS3_VFS_READONLY") ? 1 : 0;
+    return readonly;
+}
+
+/* Raw syscalls receive untrusted guest addresses.  Keep these checks local to
+ * the newly-reachable calls instead of changing established syscall behavior. */
+static int sys_fs_guest_range(uint32_t addr, uint32_t size)
+{
+    const uint64_t end = (uint64_t)addr + size;
+
+    if (!VM_READY || addr == 0 || size == 0 || end > 0x100000000ull)
+        return 0;
+    if (ppu_vm_size && end > ppu_vm_size)
+        return 0;
+    return vm_is_valid_addr(addr) && vm_is_valid_addr((uint32_t)(end - 1));
+}
+
+static int32_t sys_fs_copy_guest_path(uint32_t addr, char* out, size_t cap)
+{
+    if (!out || cap < 2 || !addr)
+        return (int32_t)CELL_EFAULT;
+
+    for (size_t i = 0; i < cap - 1; ++i) {
+        const uint64_t guest = (uint64_t)addr + i;
+        if (guest > UINT32_MAX || !sys_fs_guest_range((uint32_t)guest, 1))
+            return (int32_t)CELL_EFAULT;
+        out[i] = *(const char*)vm_to_host((uint32_t)guest);
+        if (out[i] == '\0') {
+            if (!i) return (int32_t)CELL_EINVAL;
+
+            /* sys_fs_translate_path prefixes a configured VFS root. Reject
+             * parent components before translation so lexical normalization
+             * can never walk back out of that root (or PS3_HDD0_ROOT). */
+            const char* part = out;
+            for (const char* p = out;; ++p) {
+                if (*p == '/' || *p == '\\' || *p == '\0') {
+                    if ((p - part) == 2 && part[0] == '.' && part[1] == '.')
+                        return (int32_t)CELL_EACCES;
+                    if (*p == '\0') break;
+                    part = p + 1;
+                }
+            }
+            return (int32_t)CELL_OK;
+        }
+    }
+
+    out[cap - 1] = '\0';
+    return (int32_t)CELL_ENAMETOOLONG;
+}
+
+static uint64_t sys_fs_read_be64(uint32_t addr)
+{
+    const uint8_t* p = (const uint8_t*)vm_to_host(addr);
+    return ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+           ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+           ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+           ((uint64_t)p[6] <<  8) |  (uint64_t)p[7];
+}
+
+static int64_t sys_fs_host_error(int err)
+{
+    switch (err) {
+    case ENOENT:    return (int64_t)(int32_t)CELL_ENOENT;
+    case EACCES:    return (int64_t)(int32_t)CELL_EACCES;
+    case EPERM:     return (int64_t)(int32_t)CELL_EPERM;
+    case EEXIST:    return (int64_t)(int32_t)CELL_EEXIST;
+    case EBADF:     return (int64_t)(int32_t)CELL_EBADF;
+    case EFAULT:    return (int64_t)(int32_t)CELL_EFAULT;
+    case EINVAL:    return (int64_t)(int32_t)CELL_EINVAL;
+    case EIO:       return (int64_t)(int32_t)CELL_EIO;
+    case ENOSPC:    return (int64_t)(int32_t)CELL_ENOSPC;
+    case ENOTDIR:   return (int64_t)(int32_t)CELL_ENOTDIR;
+    case EISDIR:    return (int64_t)(int32_t)CELL_EISDIR;
+    case ENOTEMPTY: return (int64_t)(int32_t)CELL_ENOTEMPTY;
+#ifdef EFBIG
+    case EFBIG:     return (int64_t)(int32_t)CELL_EFBIG;
+#endif
+#ifdef EMLINK
+    case EMLINK:    return (int64_t)(int32_t)CELL_EMLINK;
+#endif
+#ifdef EXDEV
+    case EXDEV:     return (int64_t)(int32_t)CELL_EXDEV;
+#endif
+#ifdef ENAMETOOLONG
+    case ENAMETOOLONG: return (int64_t)(int32_t)CELL_ENAMETOOLONG;
+#endif
+#ifdef EROFS
+    case EROFS:     return (int64_t)(int32_t)CELL_EROFS;
+#endif
+    default:        return (int64_t)(int32_t)CELL_EIO;
+    }
+}
+
+#ifdef _WIN32
+static int64_t sys_fs_win32_error(DWORD err)
+{
+    switch (err) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+        return (int64_t)(int32_t)CELL_ENOENT;
+    case ERROR_ACCESS_DENIED:
+        return (int64_t)(int32_t)CELL_EACCES;
+    case ERROR_FILE_EXISTS:
+    case ERROR_ALREADY_EXISTS:
+        return (int64_t)(int32_t)CELL_EEXIST;
+    case ERROR_NOT_SAME_DEVICE:
+        return (int64_t)(int32_t)CELL_EXDEV;
+    case ERROR_DIRECTORY:
+        return (int64_t)(int32_t)CELL_ENOTDIR;
+    case ERROR_DISK_FULL:
+        return (int64_t)(int32_t)CELL_ENOSPC;
+    case ERROR_WRITE_PROTECT:
+        return (int64_t)(int32_t)CELL_EROFS;
+    case ERROR_TOO_MANY_LINKS:
+        return (int64_t)(int32_t)CELL_EMLINK;
+    case ERROR_INVALID_PARAMETER:
+        return (int64_t)(int32_t)CELL_EINVAL;
+    default:
+        return (int64_t)(int32_t)CELL_EIO;
+    }
+}
+#endif
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -71,6 +203,32 @@ static void fs_normalize_sep(char* p) {
 #else
     (void)p;
 #endif
+}
+
+/* Extracted titles may use either <root>/PS3_GAME/USRDIR or the flattened
+ * <root>/USRDIR layout. Keep the original path when neither exists. */
+void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+{
+    struct stat st;
+    if (!path || !*path || stat(path, &st) == 0) return;
+    char* component = strstr(path, "/PS3_GAME/");
+#ifdef _WIN32
+    if (!component) component = strstr(path, "\\PS3_GAME\\");
+#endif
+    if (!component) return;
+    char alternate[1024];
+    size_t head = (size_t)(component - path);
+    if (head + 1 >= sizeof(alternate)) return;
+    memcpy(alternate, path, head);
+    snprintf(alternate + head, sizeof(alternate) - head, "%c%s",
+#ifdef _WIN32
+             '\\',
+#else
+             '/',
+#endif
+             component + 10);
+    if (stat(alternate, &st) == 0)
+        snprintf(path, cap, "%s", alternate);
 }
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
@@ -142,7 +300,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
      * (a Windows transient), and the junction fallback made it WORSE -- the flaky
      * stat sent a real open to a path that doesn't exist. The direct <root>/USRDIR
      * layout holds the assets; a genuinely-missing direct path is handled by the
-     * caller's open retry + the extracted-dump fallback below. */
+     * additive fallbacks below. */
 
     /* Extracted-dump fallback: our test setups often hold a title's data at
      * <root>/extracted/USRDIR/... rather than the full /dev_hdd0/game/<ID>/USRDIR
@@ -160,6 +318,17 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
                 snprintf(host_path, (size_t)host_path_size, "%s", alt);
         }
     }
+
+    /* PS3 processes run from USRDIR. Relative paths and title-root spellings
+     * such as /Data/... therefore get one last additive USRDIR lookup. */
+    if (stat(host_path, &st) != 0) {
+        char alt[1024];
+        snprintf(alt, sizeof(alt), "%s/USRDIR/%s", g_sys_fs_root, rel);
+        fs_normalize_sep(alt);
+        if (stat(alt, &st) == 0)
+            snprintf(host_path, (size_t)host_path_size, "%s", alt);
+    }
+    ps3_vfs_ps3game_fallback(host_path, (size_t)host_path_size);
 }
 
 /* ---------------------------------------------------------------------------
@@ -182,6 +351,19 @@ int64_t sys_fs_open(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EINVAL;
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
+    if (getenv("TJ_PARSEDBG") && ps3_path[0] == '\0') {
+        static int empty_path_reports = 0;
+        if (empty_path_reports++ < 4) {
+            fprintf(stderr,
+                    "[sys_fs] EMPTY path: ea=0x%08X flags=0x%08X fd_out=0x%08X lr=0x%08X\n",
+                    path_addr, (uint32_t)flags, fd_out, (uint32_t)ctx->lr);
+            {
+                extern void ppu_dump_guest_stack(ppu_context*, const char*);
+                ppu_dump_guest_stack(ctx, "sys_fs empty path");
+            }
+            fflush(stderr);
+        }
+    }
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
@@ -219,6 +401,11 @@ int64_t sys_fs_open(ppu_context* ctx)
     /* Determine fopen mode from PS3 flags */
     const char* mode;
     int access = flags & CELL_FS_O_ACCMODE;
+
+    if (sys_fs_readonly() &&
+        (access != CELL_FS_O_RDONLY ||
+         (flags & (CELL_FS_O_CREAT | CELL_FS_O_TRUNC | CELL_FS_O_APPEND))))
+        return (int64_t)(int32_t)CELL_EROFS;
 
     if (flags & CELL_FS_O_CREAT) {
         if (flags & CELL_FS_O_TRUNC) {
@@ -261,24 +448,17 @@ int64_t sys_fs_open(ppu_context* ctx)
 
     FILE* fp = fopen(host_path, mode);
 
-    /* Transient open failures: on Windows an existing, correctly-pathed file can
-     * intermittently fail to open (AV/indexer holding a share lock, or momentary
-     * handle pressure) -- which surfaced as a NONDETERMINISTIC "Cg shader file
-     * could not be read" abort. Retry a few times with a brief backoff for a
-     * read-only open of a file that exists; deterministic and cheap. */
-    if (!fp && !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
-        for (int _r = 0; !fp && _r < 3000; _r++) {
-#ifdef _WIN32
-            Sleep(1);
-#endif
-            fp = fopen(host_path, mode);
-        }
-        if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
-    }
-
     /* If CREAT flag set and file doesn't exist, try creating it */
     if (!fp && (flags & CELL_FS_O_CREAT)) {
         fp = fopen(host_path, "w+b");
+    }
+
+    /* fopen cannot open directories on Windows. The PS3 API distinguishes a
+     * directory from missing content, and titles branch on CELL_EISDIR. */
+    if (!fp) {
+        struct stat st;
+        if (stat(host_path, &st) == 0 && S_ISDIR(st.st_mode))
+            return (int64_t)(int32_t)CELL_EISDIR;
     }
 
     if (!fp) {
@@ -365,6 +545,11 @@ int64_t sys_fs_write(ppu_context* ctx)
     uint32_t buf_addr     = LV2_ARG_PTR(ctx, 1);
     uint64_t size         = LV2_ARG_U64(ctx, 2);
     uint32_t nwritten_addr = LV2_ARG_PTR(ctx, 3);
+
+    if (sys_fs_readonly()) {
+        if (nwritten_addr != 0) write_be64(nwritten_addr, 0);
+        return (int64_t)(int32_t)CELL_EROFS;
+    }
 
     int slot = fd - 3;
     if (slot < 0 || slot >= SYS_FS_FD_MAX) {
@@ -724,6 +909,8 @@ int64_t sys_fs_closedir(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_fs_mkdir(ppu_context* ctx)
 {
+    if (sys_fs_readonly())
+        return (int64_t)(int32_t)CELL_EROFS;
     uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
     /* uint32_t mode   = LV2_ARG_U32(ctx, 1); */
 
@@ -763,6 +950,8 @@ int64_t sys_fs_mkdir(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_fs_rename(ppu_context* ctx)
 {
+    if (sys_fs_readonly())
+        return (int64_t)(int32_t)CELL_EROFS;
     uint32_t old_addr = LV2_ARG_PTR(ctx, 0);
     uint32_t new_addr = LV2_ARG_PTR(ctx, 1);
 
@@ -789,6 +978,8 @@ int64_t sys_fs_rename(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_fs_unlink(ppu_context* ctx)
 {
+    if (sys_fs_readonly())
+        return (int64_t)(int32_t)CELL_EROFS;
     uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
 
     if (path_addr == 0)
@@ -815,6 +1006,8 @@ int64_t sys_fs_unlink(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_fs_rmdir(ppu_context* ctx)
 {
+    if (sys_fs_readonly())
+        return (int64_t)(int32_t)CELL_EROFS;
     uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
 
     if (path_addr == 0)
@@ -830,6 +1023,154 @@ int64_t sys_fs_rmdir(ppu_context* ctx)
     if (rmdir(host_path) != 0)
 #endif
         return (int64_t)(int32_t)CELL_ENOENT;
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_link
+ *
+ * r3 = existing path (guest pointer)
+ * r4 = new path (guest pointer)
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_link(ppu_context* ctx)
+{
+    uint32_t old_addr = LV2_ARG_PTR(ctx, 0);
+    uint32_t new_addr = LV2_ARG_PTR(ctx, 1);
+    char old_ps3[1024], new_ps3[1024];
+    int32_t rc = sys_fs_copy_guest_path(old_addr, old_ps3, sizeof(old_ps3));
+    if (rc != (int32_t)CELL_OK) return (int64_t)rc;
+    rc = sys_fs_copy_guest_path(new_addr, new_ps3, sizeof(new_ps3));
+    if (rc != (int32_t)CELL_OK) return (int64_t)rc;
+    if (sys_fs_readonly()) return (int64_t)(int32_t)CELL_EROFS;
+
+    char old_host[1024], new_host[1024];
+    sys_fs_translate_path(old_ps3, old_host, sizeof(old_host));
+    sys_fs_translate_path(new_ps3, new_host, sizeof(new_host));
+
+#ifdef _WIN32
+    if (!CreateHardLinkA(new_host, old_host, NULL))
+        return sys_fs_win32_error(GetLastError());
+#else
+    errno = 0;
+    if (link(old_host, new_host) != 0)
+        return sys_fs_host_error(errno);
+#endif
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_utime
+ *
+ * r3 = path (guest pointer)
+ * r4 = CellFsUtimbuf* ({ be s64 actime, be s64 modtime })
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_utime(ppu_context* ctx)
+{
+    uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
+    uint32_t time_addr = LV2_ARG_PTR(ctx, 1);
+    char ps3_path[1024];
+    int32_t rc = sys_fs_copy_guest_path(path_addr, ps3_path, sizeof(ps3_path));
+    if (rc != (int32_t)CELL_OK) return (int64_t)rc;
+    if (!sys_fs_guest_range(time_addr, 16))
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    const int64_t actime = (int64_t)sys_fs_read_be64(time_addr);
+    const int64_t modtime = (int64_t)sys_fs_read_be64(time_addr + 8);
+    if (sys_fs_readonly()) return (int64_t)(int32_t)CELL_EROFS;
+
+    char host_path[1024];
+    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+
+#ifdef _WIN32
+    struct __utimbuf64 times;
+    times.actime = (__time64_t)actime;
+    times.modtime = (__time64_t)modtime;
+    errno = 0;
+    if (_utime64(host_path, &times) != 0)
+        return sys_fs_host_error(errno);
+#else
+    struct utimbuf times;
+    times.actime = (time_t)actime;
+    times.modtime = (time_t)modtime;
+    if ((int64_t)times.actime != actime || (int64_t)times.modtime != modtime)
+        return (int64_t)(int32_t)CELL_EINVAL;
+    errno = 0;
+    if (utime(host_path, &times) != 0)
+        return sys_fs_host_error(errno);
+#endif
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_fsync
+ *
+ * r3 = fd
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_fsync(ppu_context* ctx)
+{
+    int32_t fd = LV2_ARG_S32(ctx, 0);
+    int slot = fd - 3;
+    if (slot < 0 || slot >= SYS_FS_FD_MAX)
+        return (int64_t)(int32_t)CELL_EBADF;
+
+    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
+    if (!f->active || !f->fp || !(f->flags & CELL_FS_O_ACCMODE))
+        return (int64_t)(int32_t)CELL_EBADF;
+
+    errno = 0;
+    if (fflush(f->fp) != 0)
+        return sys_fs_host_error(errno);
+
+#ifdef _WIN32
+    if (_commit(_fileno(f->fp)) != 0)
+#else
+    if (fsync(fileno(f->fp)) != 0)
+#endif
+        return sys_fs_host_error(errno);
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_truncate
+ *
+ * r3 = path (guest pointer)
+ * r4 = size (u64)
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_truncate(ppu_context* ctx)
+{
+    uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
+    uint64_t size = LV2_ARG_U64(ctx, 1);
+    char ps3_path[1024];
+    int32_t rc = sys_fs_copy_guest_path(path_addr, ps3_path, sizeof(ps3_path));
+    if (rc != (int32_t)CELL_OK) return (int64_t)rc;
+    if (sys_fs_readonly()) return (int64_t)(int32_t)CELL_EROFS;
+    if (size > (uint64_t)INT64_MAX) return (int64_t)(int32_t)CELL_EFBIG;
+
+    char host_path[1024];
+    struct stat st;
+    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    if (stat(host_path, &st) == 0 && S_ISDIR(st.st_mode))
+        return (int64_t)(int32_t)CELL_EISDIR;
+
+#ifdef _WIN32
+    errno = 0;
+    FILE* fp = fopen(host_path, "r+b");
+    if (!fp) return sys_fs_host_error(errno);
+    int error = _chsize_s(_fileno(fp), (__int64)size);
+    int close_error = fclose(fp);
+    if (error) return sys_fs_host_error(error);
+    if (close_error != 0) return sys_fs_host_error(errno);
+#else
+    if ((uint64_t)(off_t)size != size)
+        return (int64_t)(int32_t)CELL_EFBIG;
+    errno = 0;
+    if (truncate(host_path, (off_t)size) != 0)
+        return sys_fs_host_error(errno);
+#endif
 
     return CELL_OK;
 }
@@ -852,18 +1193,59 @@ int64_t sys_fs_ftruncate(ppu_context* ctx)
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
     if (!f->active || !f->fp)
         return (int64_t)(int32_t)CELL_EBADF;
+    if (!(f->flags & CELL_FS_O_ACCMODE))
+        return (int64_t)(int32_t)CELL_EBADF;
+    if (sys_fs_readonly())
+        return (int64_t)(int32_t)CELL_EROFS;
+    if (size > (uint64_t)INT64_MAX)
+        return (int64_t)(int32_t)CELL_EFBIG;
 
-    fflush(f->fp);
+    errno = 0;
+    if (fflush(f->fp) != 0)
+        return sys_fs_host_error(errno);
 
 #ifdef _WIN32
     int fno = _fileno(f->fp);
-    if (_chsize_s(fno, (long long)size) != 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
+    int error = _chsize_s(fno, (__int64)size);
+    if (error != 0)
+        return sys_fs_host_error(error);
 #else
     int fno = fileno(f->fp);
+    if ((uint64_t)(off_t)size != size)
+        return (int64_t)(int32_t)CELL_EFBIG;
+    errno = 0;
     if (ftruncate(fno, (off_t)size) != 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
+        return sys_fs_host_error(errno);
 #endif
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_chmod
+ *
+ * r3 = path (guest pointer)
+ * r4 = mode
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_chmod(ppu_context* ctx)
+{
+    uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
+    int32_t mode = LV2_ARG_S32(ctx, 1);
+    char ps3_path[1024];
+    int32_t rc = sys_fs_copy_guest_path(path_addr, ps3_path, sizeof(ps3_path));
+    if (rc != (int32_t)CELL_OK) return (int64_t)rc;
+    if (sys_fs_readonly()) return (int64_t)(int32_t)CELL_EROFS;
+
+    char host_path[1024];
+    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    errno = 0;
+#ifdef _WIN32
+    /* CRT chmod can only represent Windows' read-only attribute. */
+    if (_chmod(host_path, (mode & 0222) ? (_S_IREAD | _S_IWRITE) : _S_IREAD) != 0)
+#else
+    if (chmod(host_path, (mode_t)(mode & 0777)) != 0)
+#endif
+        return sys_fs_host_error(errno);
 
     return CELL_OK;
 }
@@ -885,10 +1267,15 @@ void sys_fs_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_FS_CLOSEDIR,   sys_fs_closedir);
     lv2_syscall_register(tbl, SYS_FS_STAT,       sys_fs_stat);
     lv2_syscall_register(tbl, SYS_FS_FSTAT,      sys_fs_fstat);
+    lv2_syscall_register(tbl, SYS_FS_LINK,       sys_fs_link);
     lv2_syscall_register(tbl, SYS_FS_MKDIR,      sys_fs_mkdir);
     lv2_syscall_register(tbl, SYS_FS_RENAME,     sys_fs_rename);
     lv2_syscall_register(tbl, SYS_FS_RMDIR,      sys_fs_rmdir);
     lv2_syscall_register(tbl, SYS_FS_UNLINK,     sys_fs_unlink);
+    lv2_syscall_register(tbl, SYS_FS_UTIME,      sys_fs_utime);
     lv2_syscall_register(tbl, SYS_FS_LSEEK,      sys_fs_lseek);
+    lv2_syscall_register(tbl, SYS_FS_FSYNC,      sys_fs_fsync);
+    lv2_syscall_register(tbl, SYS_FS_TRUNCATE,   sys_fs_truncate);
     lv2_syscall_register(tbl, SYS_FS_FTRUNCATE,  sys_fs_ftruncate);
+    lv2_syscall_register(tbl, SYS_FS_CHMOD,      sys_fs_chmod);
 }

@@ -315,7 +315,7 @@ s32 cellMouseSetTabletMode(u32 port_no, u32 mode)
     if (!s_mouse_initialized)
         return CELL_MOUSE_ERROR_UNINITIALIZED;
 
-    if (port_no >= CELL_MOUSE_MAX_MICE)
+    if (port_no >= s_mouse_max_connect)
         return CELL_MOUSE_ERROR_INVALID_PARAMETER;
 
     s_mouse_ports[port_no].mode = mode;
@@ -327,7 +327,7 @@ s32 cellMouseClearBuf(u32 port_no)
     if (!s_mouse_initialized)
         return CELL_MOUSE_ERROR_UNINITIALIZED;
 
-    if (port_no >= CELL_MOUSE_MAX_MICE)
+    if (port_no >= s_mouse_max_connect)
         return CELL_MOUSE_ERROR_INVALID_PARAMETER;
 
     MousePortState* ms = &s_mouse_ports[port_no];

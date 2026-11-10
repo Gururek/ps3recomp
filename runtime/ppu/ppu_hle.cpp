@@ -22,6 +22,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>       /* getenv, atoi (boot trace) */
+#include <chrono>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 /* Single flat NID -> handler table (all modules share it; resolution is by
  * NID which is globally unique). Sized for the firmware import surface. */
@@ -33,7 +38,21 @@ static int            g_hle_inited = 0;
 extern "C" void ps3_hle_register(uint32_t nid, const char* name, void* handler)
 {
     if (!g_hle_inited) { ps3_nid_table_init(&g_hle_nids, g_hle_storage, HLE_NID_CAP); g_hle_inited = 1; }
-    ps3_nid_table_add(&g_hle_nids, nid, name, handler);
+    /* Registration order is intentional: generic libraries register first,
+     * then a title may install a compatibility override for the same NID.
+     * The old append-only table used first-match lookup, so later overrides
+     * were present but unreachable. Replace an existing entry in place. */
+    if (ps3_nid_entry* existing = ps3_nid_table_find(&g_hle_nids, nid)) {
+        existing->name = name;
+        existing->handler = handler;
+        return;
+    }
+    if (ps3_nid_table_add(&g_hle_nids, nid, name, handler) != 0) {
+        fprintf(stderr,
+                "[HLE] FATAL: generic NID registry full (%u entries), rejected 0x%08X %s\n",
+                g_hle_nids.count, nid, name ? name : "<unnamed>");
+        abort();
+    }
 }
 
 extern "C" uint32_t ps3_hle_count(void) { return g_hle_inited ? g_hle_nids.count : 0; }
@@ -42,14 +61,40 @@ extern "C" uint32_t ps3_hle_count(void) { return g_hle_inited ? g_hle_nids.count
  * args beyond the generic ABI, set registers like r13, touch memory, etc.).
  * Registered separately and dispatched before the generic table. */
 typedef void (*hle_ctx_fn)(ppu_context*);
-#define HLE_CTX_CAP 256
-static struct { uint32_t nid; hle_ctx_fn fn; } g_ctx[HLE_CTX_CAP];
+#define HLE_CTX_CAP 1024
+static struct { uint32_t nid; const char* name; hle_ctx_fn fn; } g_ctx[HLE_CTX_CAP];
 static uint32_t g_ctx_count = 0;
 
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn)
 {
-    (void)name;
-    if (g_ctx_count < HLE_CTX_CAP) { g_ctx[g_ctx_count].nid = nid; g_ctx[g_ctx_count].fn = fn; g_ctx_count++; }
+    /* Later registrations are title-specific overrides. Preserve their
+     * precedence without accumulating duplicate entries. */
+    for (uint32_t i = 0; i < g_ctx_count; ++i) {
+        if (g_ctx[i].nid == nid) {
+            g_ctx[i].name = name;
+            g_ctx[i].fn = fn;
+            return;
+        }
+    }
+    if (g_ctx_count >= HLE_CTX_CAP) {
+        fprintf(stderr,
+                "[HLE] FATAL: context NID registry full (%u entries), rejected 0x%08X %s\n",
+                g_ctx_count, nid, name ? name : "<unnamed>");
+        abort();
+    }
+    g_ctx[g_ctx_count].nid = nid;
+    g_ctx[g_ctx_count].name = name;
+    g_ctx[g_ctx_count].fn = fn;
+    ++g_ctx_count;
+}
+
+extern "C" uint32_t ps3_hle_ctx_count(void) { return g_ctx_count; }
+
+extern "C" int ps3_hle_has(uint32_t nid)
+{
+    for (uint32_t i = 0; i < g_ctx_count; i++)
+        if (g_ctx[i].nid == nid) return 1;
+    return g_hle_inited && ps3_nid_table_find(&g_hle_nids, nid) != nullptr;
 }
 
 /* Generic PPC integer/pointer ABI adapter. */
@@ -78,8 +123,14 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd,
                                     uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
 /* Weak: builds that don't link cellGcmSys.c (test harnesses) get a null and skip. */
 extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
-extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleA(const char*);
-static inline void* ps3_GetModuleHandleA(const char* m){ return GetModuleHandleA(m); }
+extern "C" __attribute__((weak)) void ppu_poll_display_callbacks(ppu_context* ctx);
+/* Weak, same reason: TJ_HLE_PERF companion line for cellGcmSys.c poll waits. */
+extern "C" __attribute__((weak)) void cellGcm_wait_perf_report(void);
+extern "C" void ppu_dispatch_display_callbacks(void)
+{
+    if (ppu_gcm_pump) ppu_gcm_pump();
+}
+static inline void* ps3_GetModuleHandleA(const char* m){ return (void*)GetModuleHandleA(m); }
 
 /* An unresolved NID is a firmware import we never registered. Returning
  * CELL_OK "so the game keeps going" is the single biggest source of
@@ -94,27 +145,21 @@ static inline void* ps3_GetModuleHandleA(const char* m){ return GetModuleHandleA
  * how often each is hit, and make the fabricated return an explicit CHOICE
  * rather than the silent default.
  *
- * The default stays CELL_OK, because faking is currently LOAD-BEARING: LBP
- * calls cellFsSdataOpen (0xB1840B53, its encrypted data file) and cellHttpsInit
- * (0x522180BC) during early boot and shuts down cleanly if either fails, so
- * PS3_HLE_UNRESOLVED=fail dies at 144 log lines vs ~148,000. The days-long
- * debugging was never caused by the fake per se -- it was caused by the fake
- * being SILENT (a global first-40-line cap hid every import past the 40th). So
- * the fix is visibility: report each DISTINCT unresolved NID once, with a hit
- * count, always. `fail` remains available to A/B which missing import is
- * load-bearing -- run it and read the two or three NIDs it reports.
+ * Recompiled titles must not continue from fabricated success with untouched
+ * out-parameters.  Missing firmware behavior therefore defaults to CELL_ENOSYS.
+ * A title still under initial bring-up may explicitly opt into the old behavior
+ * while collecting its missing-NID ledger.
  *
- *   PS3_HLE_UNRESOLVED = ok   (default): r3 = CELL_OK, reported once per NID.
- *                        = fail: r3 = CELL_ERROR_ERROR, to find load-bearing
- *                                imports (expect an early, clean shutdown).
+ *   PS3_HLE_UNRESOLVED = fail (default): r3 = CELL_ENOSYS.
+ *                        = ok: r3 = CELL_OK, reported as fabricated success.
  */
 static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 {
-    enum { CELL_ERROR_ERROR = (int)0x8001003Fu };  /* generic CELL failure */
+    enum { CELL_ENOSYS = (int)0x80010003u };
     static int s_fake = -1;
     if (s_fake < 0) {
         const char* m = getenv("PS3_HLE_UNRESOLVED");
-        s_fake = (m && (m[0]=='f' || m[0]=='F')) ? 0 : 1;   /* "fail" -> error, else fake */
+        s_fake = (m && (m[0]=='o' || m[0]=='O')) ? 1 : 0;
     }
     /* First-seen set: report each NID once, then count silently. Linear scan
      * over a small array -- the count of DISTINCT unresolved NIDs a title hits
@@ -128,17 +173,314 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
     uint32_t count = (i < 512) ? ++hits[i] : 0;
     (void)count;
     if (count == 1)
-        fprintf(stderr, "[hle] UNRESOLVED NID 0x%08X -> faking %s "
-                        "(unregistered import%s)\n",
-                nid, s_fake ? "CELL_OK" : "CELL_ERROR_ERROR",
-                s_fake ? "; PS3_HLE_UNRESOLVED=fail to find load-bearing ones"
-                       : "");
+        fprintf(stderr, "[hle] UNRESOLVED NID 0x%08X -> %s%s\n",
+                nid, s_fake ? "fabricated CELL_OK" : "CELL_ENOSYS",
+                s_fake ? " (PS3_HLE_UNRESOLVED=ok)" : "");
 
-    ctx->gpr[3] = s_fake ? 0u : (uint64_t)(uint32_t)CELL_ERROR_ERROR;
+    ctx->gpr[3] = s_fake ? 0u : (uint64_t)(uint32_t)CELL_ENOSYS;
 }
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+
+/* TJ_HLE_PERF=1: fixed-table, main-PPU-only wall-duration profiler. HLE calls
+ * are synchronous on this context, so this state needs no locks or allocation. */
+enum { TJ_HLE_PERF_CAP = 256, TJ_HLE_PERF_TOP = 8 };
+struct tj_hle_perf_site {
+    uint32_t nid, lr;
+    const char* name;
+    uint64_t calls, total_ticks, max_ticks;
+};
+struct tj_hle_perf_state {
+    int enabled;
+    LARGE_INTEGER frequency;
+    uint64_t next_report_ticks, dropped;
+    tj_hle_perf_site sites[TJ_HLE_PERF_CAP];
+    unsigned count;
+};
+
+static uint64_t tj_hle_perf_us(uint64_t ticks, uint64_t frequency)
+{
+    return (ticks / frequency) * 1000000ULL +
+           ((ticks % frequency) * 1000000ULL) / frequency;
+}
+
+static const char* tj_hle_perf_name(uint32_t nid)
+{
+    for (uint32_t i = 0; i < g_ctx_count; ++i)
+        if (g_ctx[i].nid == nid) return g_ctx[i].name ? g_ctx[i].name : "ctx-handler";
+    ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
+    return e && e->name ? e->name : "unregistered";
+}
+
+static void tj_hle_perf_report(tj_hle_perf_state& state)
+{
+    for (unsigned rank = 0; rank < TJ_HLE_PERF_TOP && rank < state.count; ++rank) {
+        unsigned best = rank;
+        for (unsigned i = rank + 1; i < state.count; ++i)
+            if (state.sites[i].total_ticks > state.sites[best].total_ticks)
+                best = i;
+        tj_hle_perf_site selected = state.sites[best];
+        state.sites[best] = state.sites[rank];
+        state.sites[rank] = selected;
+        fprintf(stderr,
+                "[TJ-HLE-PERF] top=%u nid=0x%08X name=%s lr=0x%08X calls=%llu total=%lluus max=%lluus\n",
+                rank + 1, selected.nid, selected.name ? selected.name : "?", selected.lr,
+                (unsigned long long)selected.calls,
+                (unsigned long long)tj_hle_perf_us(selected.total_ticks,
+                                                    (uint64_t)state.frequency.QuadPart),
+                (unsigned long long)tj_hle_perf_us(selected.max_ticks,
+                                                    (uint64_t)state.frequency.QuadPart));
+    }
+    if (state.dropped)
+        fprintf(stderr, "[TJ-HLE-PERF] dropped-calls=%llu\n",
+                (unsigned long long)state.dropped);
+    /* Same window and thread: GCM waits this table cannot see (the FIFO
+     * recycle callback, SetWaitFlip, the guest's GetFlipStatus poll loop). */
+    if (cellGcm_wait_perf_report) cellGcm_wait_perf_report();
+    fflush(stderr);
+    state.count = 0;
+    state.dropped = 0;
+}
+
+static void tj_hle_perf_record(tj_hle_perf_state& state, uint32_t nid,
+                               uint32_t lr, const char* name, uint64_t elapsed)
+{
+    for (unsigned i = 0; i < state.count; ++i) {
+        tj_hle_perf_site& site = state.sites[i];
+        if (site.nid == nid && site.lr == lr) {
+            site.calls++;
+            site.total_ticks += elapsed;
+            if (elapsed > site.max_ticks) site.max_ticks = elapsed;
+            return;
+        }
+    }
+    if (state.count == TJ_HLE_PERF_CAP) { state.dropped++; return; }
+    tj_hle_perf_site& site = state.sites[state.count++];
+    site.nid = nid; site.lr = lr; site.name = name;
+    site.calls = 1; site.total_ticks = elapsed; site.max_ticks = elapsed;
+}
+
+struct tj_hle_perf_guard {
+    tj_hle_perf_state* state = nullptr;
+    uint32_t nid = 0, lr = 0;
+    const char* name = nullptr;
+    uint64_t begin = 0;
+    tj_hle_perf_guard(uint32_t call_nid, ppu_context* ctx) {
+        if (!ctx || ctx->thread_id != 1) return;
+        static tj_hle_perf_state s = {};
+        if (!s.enabled) {
+            s.enabled = getenv("TJ_HLE_PERF") ? 1 : -1;
+            if (s.enabled > 0) QueryPerformanceFrequency(&s.frequency);
+        }
+        if (s.enabled < 0) return;
+        state = &s; nid = call_nid; lr = (uint32_t)ctx->lr;
+        name = tj_hle_perf_name(call_nid);
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        begin = (uint64_t)now.QuadPart;
+    }
+    ~tj_hle_perf_guard() {
+        if (!state) return;
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        tj_hle_perf_record(*state, nid, lr, name, (uint64_t)now.QuadPart - begin);
+        if (!state->next_report_ticks)
+            state->next_report_ticks = (uint64_t)now.QuadPart +
+                                       (uint64_t)state->frequency.QuadPart * 2ULL;
+        if ((uint64_t)now.QuadPart >= state->next_report_ticks) {
+            /* End timestamp is already captured: reporting itself is excluded. */
+            tj_hle_perf_report(*state);
+            state->next_report_ticks = (uint64_t)now.QuadPart +
+                                       (uint64_t)state->frequency.QuadPart * 2ULL;
+        }
+    }
+};
+
+/* TJ_PAD_CALLER_TRACE=1: compact, diagnostic-only caller inventory for
+ * cellPadGetData. Tokyo Jungle reaches the import from a shared pad wrapper,
+ * so the import LR alone is not enough to classify a guest menu state. The
+ * lifted wrapper saves its own caller at [r1+0xC0]; report that value together
+ * with the live state registers. This is observation only: no pad state,
+ * guest memory, scheduling, or input is changed. Each host thread owns its
+ * small table, avoiding locks on the high-frequency pad path. */
+enum { TJ_PAD_CALLER_CAP = 32, TJ_PAD_CALLER_REPORT_LIMIT = 8 };
+struct tj_pad_input_snapshot {
+    uint32_t data_ea;
+    int32_t length, game_x, game_y, profile;
+    uint16_t left_x, left_y;
+};
+
+/* At the next entry, the previous packet and its guest-decoded axes are both
+ * available. Restrict the title-specific offsets to its verified pad wrapper. */
+static bool tj_pad_read_input_snapshot(ppu_context* ctx, tj_pad_input_snapshot* out)
+{
+    if (!ctx || !out || !vm_base ||
+        (ctx->lr != 0x001F7248 && ctx->lr != 0x001F7620 && ctx->lr != 0x001F7640))
+        return false;
+    const uint32_t object = (uint32_t)ctx->gpr[30];
+    const uint32_t data_ea = (uint32_t)ctx->gpr[4];
+    if (object < 0x10000u || object > 0xFFFFFFFFu - 0x5C4u || data_ea != object + 4u)
+        return false;
+    out->data_ea = data_ea;
+    out->length = (int32_t)vm_read32(data_ea);
+    out->left_x = vm_read16(data_ea + 4u + 6u * 2u);
+    out->left_y = vm_read16(data_ea + 4u + 7u * 2u);
+    out->game_x = (int32_t)vm_read32(object + 0x488u);
+    out->game_y = (int32_t)vm_read32(object + 0x494u);
+    const uint32_t profile_ea = vm_read32(object + 0x5C0u);
+    out->profile = profile_ea >= 0x10000u && profile_ea <= 0xFFFFFFF8u
+        ? (int32_t)vm_read32(profile_ea + 4u) : -1;
+    return true;
+}
+
+struct tj_pad_action_snapshot {
+    uint32_t ea, slot, input_type, scale_bits, bias_bits, deadzone_bits, value_bits;
+    int32_t raw_value;
+};
+
+/* func_001F6464 updates the action pointers at pad+0x88. func_001F6200
+ * selects an axis and func_001F6128 writes its scaled/dead-zoned value at+0x18.
+ * Read only on observed input changes, not on every high-frequency pad poll. */
+static unsigned tj_pad_read_action_snapshots(uint32_t object,
+    tj_pad_action_snapshot* out, unsigned capacity)
+{
+    if (!vm_base || !out || !capacity || object < 0x10000u ||
+        object > 0xFFFFFFFFu - 0x5C4u) return 0;
+    unsigned count = 0;
+    for (unsigned slot = 0; slot < 256 && count < capacity; ++slot) {
+        const uint32_t ea = vm_read32(object + 0x88u + slot * 4u);
+        if (ea < 0x10000u || ea > 0xFFFFFFFFu - 0x24u ||
+            vm_read32(ea) != object) continue;
+        const uint32_t type = vm_read32(ea + 8u);
+        if (type > 9u) continue; /* digital actions use another representation */
+        tj_pad_action_snapshot* action = &out[count++];
+        action->ea = ea;
+        action->slot = slot;
+        action->input_type = type;
+        action->scale_bits = vm_read32(ea + 0xCu);
+        action->bias_bits = vm_read32(ea + 0x10u);
+        action->deadzone_bits = vm_read32(ea + 0x14u);
+        action->value_bits = vm_read32(ea + 0x18u);
+        action->raw_value = (int32_t)vm_read32(ea + 0x1Cu);
+    }
+    return count;
+}
+
+struct tj_pad_caller_site {
+    uint32_t tid, lr, saved_caller;
+    uint64_t calls, first_ms, last_report_ms;
+    unsigned reports;
+    tj_pad_input_snapshot last_input;
+    unsigned input_reports;
+    bool input_seen;
+};
+struct tj_pad_caller_state {
+    tj_pad_caller_site sites[TJ_PAD_CALLER_CAP];
+    unsigned count;
+    bool dropped_reported;
+};
+
+static uint64_t tj_pad_caller_now_ms(void)
+{
+    using namespace std::chrono;
+    return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static void tj_pad_caller_trace(ppu_context* ctx)
+{
+    static const bool enabled = getenv("TJ_PAD_CALLER_TRACE") != nullptr;
+    if (!enabled || !ctx) return;
+
+    const uint32_t tid = (uint32_t)ctx->thread_id;
+    const uint32_t lr = (uint32_t)ctx->lr;
+    const uint32_t sp = (uint32_t)ctx->gpr[1];
+    /* A 32-bit guest stack pointer near wrap cannot have a valid +0xC0 slot.
+     * Do not probe it; normal PPU stacks are well inside this bound. */
+    const uint32_t saved_caller = (vm_base && sp <= 0xFFFFFF3Fu)
+        ? (uint32_t)vm_read64(sp + 0xC0u) : 0u;
+    const uint64_t now_ms = tj_pad_caller_now_ms();
+
+    static thread_local tj_pad_caller_state state = {};
+    tj_pad_caller_site* site = nullptr;
+    for (unsigned i = 0; i < state.count; ++i) {
+        if (state.sites[i].tid == tid && state.sites[i].lr == lr &&
+            state.sites[i].saved_caller == saved_caller) {
+            site = &state.sites[i];
+            break;
+        }
+    }
+    if (!site) {
+        if (state.count == TJ_PAD_CALLER_CAP) {
+            if (!state.dropped_reported) {
+                fprintf(stderr, "[TJ-PAD-CALLER] dropped=1 reason=site-cap cap=%u tid=%u\n",
+                        TJ_PAD_CALLER_CAP, tid);
+                fflush(stderr);
+                state.dropped_reported = true;
+            }
+            return;
+        }
+        site = &state.sites[state.count++];
+        site->tid = tid;
+        site->lr = lr;
+        site->saved_caller = saved_caller;
+        site->calls = 0;
+        site->first_ms = now_ms;
+        site->last_report_ms = now_ms;
+        site->reports = 0;
+        fprintf(stderr,
+                "[TJ-PAD-CALLER] phase=first tid=%u lr=0x%08X saved_caller=0x%08X "
+                "sp=0x%08X r3=0x%08X r4=0x%08X r27=0x%08X r30=0x%08X r31=0x%08X\n",
+                tid, lr, saved_caller, sp, (uint32_t)ctx->gpr[3],
+                (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[27],
+                (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[31]);
+        fflush(stderr);
+    }
+    site->calls++;
+    tj_pad_input_snapshot input = {};
+    if (site->input_reports < 32 && tj_pad_read_input_snapshot(ctx, &input) &&
+        (!site->input_seen || input.data_ea != site->last_input.data_ea ||
+         input.length != site->last_input.length || input.profile != site->last_input.profile ||
+         input.left_x != site->last_input.left_x || input.left_y != site->last_input.left_y ||
+         input.game_x != site->last_input.game_x || input.game_y != site->last_input.game_y)) {
+        fprintf(stderr,
+            "[TJ-PAD-CALLER] phase=input tid=%u lr=%08X saved_caller=%08X data=%08X "
+            "previous_len=%d previous_left=%u,%u previous_game=%d,%d profile=%d\n",
+            tid, lr, saved_caller, input.data_ea, input.length,
+            (unsigned)input.left_x, (unsigned)input.left_y,
+            input.game_x, input.game_y, input.profile);
+        tj_pad_action_snapshot actions[16] = {};
+        const unsigned action_count = tj_pad_read_action_snapshots(
+            input.data_ea - 4u, actions, 16);
+        for (unsigned i = 0; i < action_count; ++i) {
+            const tj_pad_action_snapshot& action = actions[i];
+            fprintf(stderr,
+                "[TJ-PAD-ACTION] previous=1 pad=%08X action=%08X slot=%u type=%u "
+                "scale=%08X bias=%08X deadzone=%08X value=%08X raw=%d\n",
+                input.data_ea - 4u, action.ea, action.slot, action.input_type,
+                action.scale_bits, action.bias_bits, action.deadzone_bits,
+                action.value_bits, action.raw_value);
+        }
+        site->last_input = input;
+        site->input_seen = true;
+        ++site->input_reports;
+        fflush(stderr);
+    }
+    if (site->reports < TJ_PAD_CALLER_REPORT_LIMIT &&
+        (site->calls == 256 || now_ms - site->last_report_ms >= 1000)) {
+        fprintf(stderr,
+                "[TJ-PAD-CALLER] phase=sample tid=%u lr=0x%08X saved_caller=0x%08X "
+                "calls=%llu elapsed_ms=%llu sp=0x%08X r3=0x%08X r4=0x%08X "
+                "r27=0x%08X r30=0x%08X r31=0x%08X\n",
+                tid, lr, saved_caller, (unsigned long long)site->calls,
+                (unsigned long long)(now_ms - site->first_ms), sp,
+                (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                (uint32_t)ctx->gpr[27], (uint32_t)ctx->gpr[30],
+                (uint32_t)ctx->gpr[31]);
+        fflush(stderr);
+        site->last_report_ms = now_ms;
+        site->reports++;
+    }
+}
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     /* Preserve the caller TOC (r2) across the HLE call. ELFv1 makes r2 caller-saved
@@ -151,12 +493,17 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * base (e.g. func_002B03AC's `*(r2-0x4B34)` FMOD list head -> null -> infinite walk
      * -> no draws). Snapshot the caller r2+sp now and restore BOTH the live r2 and the
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
+    tj_hle_perf_guard _perf{ nid, ctx };
     struct _TocGuard { ppu_context* c; uint64_t toc, sp;
         ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc); } } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
-    /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
-     * guest execution -- the vblank ticker only marks ticks pending; the handlers
-     * run here so guest code never executes concurrently on the ticker thread. */
-    if (ppu_gcm_pump) ppu_gcm_pump();
+    /* Deliver pending display callbacks only on the registered main PPU thread.
+     * Running this on every HLE boundary let arbitrary workers consume the edge
+     * and synchronously enter guest vblank/flip code. A worker could then block
+     * inside that callback forever (Tokyo Jungle: sgx-audio-thr), so its real
+     * producer loop never resumed. The ticker still publishes scalar flip status
+     * immediately; only guest callback execution is restricted here. */
+    if (ppu_poll_display_callbacks) ppu_poll_display_callbacks(ctx);
+    else if (ppu_gcm_pump && ctx->thread_id == 1) ppu_gcm_pump();
 
     /* YDKJ_TUNERFIX (at the top so it wins over any registered handler): the
      * profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre
@@ -173,8 +520,32 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
     g_last_hle_nid = nid;
+    if (nid == 0x8B72CDA1u)
+        tj_pad_caller_trace(ctx);
+    static int s_frame_state = -1;
+    if (s_frame_state < 0) s_frame_state = getenv("TJ_FRAME_STATE") ? 1 : 0;
+    if (nid == 0x72A577CEu && s_frame_state) {
+        static unsigned frame_wait_calls = 0;
+        unsigned call = ++frame_wait_calls;
+        if ((call % 600u) == 0u) {
+            const uint32_t object = (uint32_t)ctx->gpr[28];
+            const uint32_t saved_caller = (uint32_t)vm_read64(ctx->gpr[1] + 0xA0);
+            fprintf(stderr,
+                    "[TJ-FRAME-STATE] n=%u caller=0x%08X object=0x%08X "
+                    "r30=%08X r31=%08X f00=%08X f04=%08X f08=%08X "
+                    "f0c=%08X f10=%08X f14=%08X f18=%08X f1c=%08X\n",
+                    call, saved_caller, object, (uint32_t)ctx->gpr[30],
+                    (uint32_t)ctx->gpr[31], vm_read32(object + 0x00),
+                    vm_read32(object + 0x04), vm_read32(object + 0x08),
+                    vm_read32(object + 0x0C), vm_read32(object + 0x10),
+                    vm_read32(object + 0x14), vm_read32(object + 0x18),
+                    vm_read32(object + 0x1C));
+            fflush(stderr);
+        }
+    }
     /* GFX-SCAN: is the menu .gfx ever inflated into guest RAM? (magic 'GFX'=47 46 58) */
-    { static long _c=0; if(getenv("YDKJ_GFXSCAN") && (++_c % 200000)==0){ extern uint8_t* vm_base;
+    { static long _c=0; static int _gs=-1; if(_gs<0)_gs=getenv("YDKJ_GFXSCAN")?1:0;
+      if(_gs && (++_c % 200000)==0){ extern uint8_t* vm_base;
         int gfx=0,cfx=0,swf=0,dds=0,png=0; for(uint32_t a=0x10000; a<0x0FF00000u; a++){
           uint8_t m0=vm_base[a],m1=vm_base[a+1],m2=vm_base[a+2],vv=vm_base[a+3];
           /* uncompressed GFx: 'GFX'/'GFC' ver 4..20 */
@@ -196,6 +567,42 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         fprintf(stderr, "[HLETRACE] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X lr=0x%08X\n",
                 nid, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
                 (uint32_t)ctx->gpr[5], (uint32_t)ctx->lr);
+    }
+    /* Tokyo Jungle SPURS setup probe: capture the short import sequence after
+     * taskset creation without enabling the extremely noisy global HLE trace.
+     * The Survival workers park on the object immediately following taskset 0;
+     * this proves whether cellSpursBarrierInitialize (0x7FDF4FEF) is actually
+     * called, with which object/count, and what calls surround it. */
+    { static int s_spurs_setup_left = 0;
+      static int s_spurs_setup_trace = -1;
+      if (s_spurs_setup_trace < 0)
+          s_spurs_setup_trace = getenv("YDKJ_SPURS_SETUP_TRACE") ? 1 : 0;
+      if (s_spurs_setup_trace) {
+          if (nid == 0xC10931CBu || nid == 0x52CC6C82u)
+              s_spurs_setup_left = 96;
+          if (s_spurs_setup_left > 0) {
+              fprintf(stderr,
+                      "[SPURS-SETUP] nid=0x%08X r3=0x%08X r4=0x%08X "
+                      "r5=0x%08X r6=0x%08X lr=0x%08X\n",
+                      nid, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                      (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6],
+                      (uint32_t)ctx->lr);
+              s_spurs_setup_left--;
+          }
+      } }
+    static int s_boot_state = -1;
+    if (s_boot_state < 0) s_boot_state = getenv("TJ_BOOT_STATE") ? 1 : 0;
+    if (nid == 0x189A74DAu && s_boot_state) {
+        const uint32_t holder = vm_read32(0x0035A8B0u);
+        const uint32_t manager = holder ? vm_read32(holder) : 0;
+        const uint32_t vtable = manager ? vm_read32(manager) : 0;
+        const uint32_t init_opd = vtable ? vm_read32(vtable + 8) : 0;
+        fprintf(stderr,
+                "[TJ:boot-state] object=0x02000000 vtable=0x%08X flags=%u,%u state=0x%08X "
+                "holder=0x%08X manager=0x%08X mgr_vtable=0x%08X init_opd=0x%08X init_code=0x%08X\n",
+                vm_read32(0x02000000u), vm_read8(0x02000005u),
+                vm_read8(0x02000006u), vm_read32(0x02000010u), holder,
+                manager, vtable, init_opd, init_opd ? vm_read32(init_opd) : 0);
     }
     /* Bad-lock locator (FLOW_BADLOCK): sys_lwmutex_lock (0x1573DC3F) on a garbage/null
      * object (r3 < 0x10000 or high-bit set) in m_InitEntityHierarchy — host backtrace
@@ -259,7 +666,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
           fprintf(stderr,"%s\n",b); }
 #ifdef _WIN32
         { extern unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long,unsigned long,void**,unsigned long*);
-          extern void* __stdcall GetModuleHandleA(const char*);
           void* bt[40]; unsigned short fr=RtlCaptureStackBackTrace(0,40,bt,0);
           char* mb=(char*)GetModuleHandleA(0); char line[1100]; int p=snprintf(line,sizeof line,"[exit-chain] HOST-bt rva:");
           for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
@@ -404,7 +810,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 else if (vm_base[desc+0xC]!=0xFF) {
                     uint32_t iopd = prx_resolve_export(0x22AAB31Du);
                     static int _g=0; if(_g++<6) fprintf(stderr,"[GUESTINIT] pre-init descriptor 0x%08X via 0x22AAB31D (opd=0x%08X) before create-task\n", desc, iopd);
-                    if (iopd) { ppu_guest_call(iopd, desc, 1, 8, 0x398);
+                    if (iopd) { ppu_guest_call(iopd, desc, 1, 8, 0x398, 0, 0, 0, 0);
                         if(_g<=6) fprintf(stderr,"[GUESTINIT] after pre-init: descriptor 0x%08X +0xC=0x%02X\n", desc, vm_base[desc+0xC]); }
                 }
             }
@@ -509,8 +915,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
-        static int logged = 0;
-        if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
          * protocol so it can be implemented. */
@@ -557,7 +961,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               ctx->gpr[3] = 0x80010002u; /* generic failure (net unavailable) */
               return;
           } } }
-        ctx->gpr[3] = 0;   /* CELL_OK-ish so the game keeps going */
+        ps3_hle_unresolved(nid, ctx);
         return;
     }
     g_last_hle_name = e->name;

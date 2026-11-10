@@ -47,6 +47,9 @@ typedef struct sys_event_t {
 
 typedef struct sys_event_queue_info {
     int      active;
+    int      destroying;
+    uint32_t generation; /* incremented allocation identity; id reuse is stale */
+    uint32_t receiver_refs; /* receive callers holding this slot alive */
     uint32_t protocol;
     int32_t  type;
     char     name[8];
@@ -62,9 +65,11 @@ typedef struct sys_event_queue_info {
 #ifdef _WIN32
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE not_empty;
+    CONDITION_VARIABLE no_receivers;
 #else
     pthread_mutex_t lock;
     pthread_cond_t  not_empty;
+    pthread_cond_t  no_receivers;
 #endif
 
 } sys_event_queue_info;
@@ -152,6 +157,10 @@ void sys_event_init(lv2_syscall_table* tbl);
 int sys_event_queue_push_by_id(uint32_t queue_id,
                                uint64_t source, uint64_t data1,
                                uint64_t data2,  uint64_t data3);
+uint32_t sys_event_queue_generation(uint32_t queue_id);
+int sys_event_queue_push_by_handle(uint32_t queue_id, uint32_t generation,
+                                   uint64_t source, uint64_t data1,
+                                   uint64_t data2, uint64_t data3);
 
 /* Resolve an event queue by its ipc_key; returns queue_id (1-based) or 0. */
 uint32_t sys_event_find_queue_by_key(uint64_t key);

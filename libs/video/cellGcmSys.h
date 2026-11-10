@@ -72,7 +72,11 @@ extern "C" {
 #define CELL_GCM_LOCATION_MAIN          1  /* main memory */
 
 /* IO mapping limits */
-#define CELL_GCM_MAX_IO_MAPPINGS        16
+/* The RSX offset tables are page based; titles may create many separate main
+ * memory mappings over their lifetime. Tokyo Jungle consumes 16 during boot
+ * and needs additional notify/render mappings when Survival starts, so the old
+ * software-only cap rejected valid mappings and stopped FIFO translation. */
+#define CELL_GCM_MAX_IO_MAPPINGS        256
 
 /* Debug output levels */
 #define CELL_GCM_DEBUG_LEVEL0           0
@@ -89,6 +93,18 @@ typedef struct CellGcmControl {
     volatile u32 get;       /* read pointer (offset into cmd buffer) */
     volatile u32 ref;       /* reference value (written by RSX on completion) */
 } CellGcmControl;
+
+/* Optional host-side frame-profiler snapshot.  This is diagnostic state only:
+ * callers must opt in with TJ_FRAME_PROF before the HLE records a producer. */
+typedef struct CellGcmFrameProfSnapshot {
+    u32 generation;
+    u32 flip_sequence;
+    u32 source_kind;       /* 1=direct HLE producer, 2=FIFO dispatcher */
+    u32 source_host_tid;   /* producer for direct HLE, dispatcher for FIFO */
+    u32 put;
+    u32 get;
+    u32 current;
+} CellGcmFrameProfSnapshot;
 
 /* GCM context data — the game reads/writes this to submit RSX commands.
  * On PS3, gCellGcmCurrentContext points to one of these.
@@ -111,6 +127,30 @@ typedef struct CellGcmDisplayInfo {
     u32 width;
     u32 height;
 } CellGcmDisplayInfo;
+
+enum { CELL_GCM_FLIP_SOURCE_DIRECT_HLE = 1, CELL_GCM_FLIP_SOURCE_FIFO = 2 };
+
+/* Host-side flip handoff. Generation, buffer_id and source travel together so
+ * a present/drain boundary cannot pair one flip's sequence with another
+ * flip's display surface. */
+typedef struct CellGcmFlipTicket {
+    u64 generation;
+    u32 buffer_id;
+    u32 source;
+} CellGcmFlipTicket;
+
+enum {
+    CELL_GCM_FLIP_PUBLICATION_QPC_OFF = 0,
+    CELL_GCM_FLIP_PUBLICATION_QPC_VALID = 1,
+    CELL_GCM_FLIP_PUBLICATION_QPC_FAILED = 2
+};
+
+/* Optional host diagnostic returned with a ticket. This is deliberately not
+ * part of CellGcmFlipTicket: producer/consumer ticket ABI remains unchanged. */
+typedef struct CellGcmFlipPublicationTiming {
+    u64 publication_qpc;
+    u32 publication_qpc_state;
+} CellGcmFlipPublicationTiming;
 
 /* Offset table for address translation */
 typedef struct CellGcmOffsetTable {
@@ -220,6 +260,9 @@ s32 cellGcmGetConfiguration(CellGcmConfig* config);
 /* NID: 0x8572A8E0 */
 CellGcmControl* cellGcmGetControlRegister(void);
 
+/* Read a best-effort, guest-memory-safe FIFO/flip snapshot for TJ_FRAME_PROF. */
+void cellGcm_frame_prof_snapshot(CellGcmFrameProfSnapshot* out);
+
 /* Display / flip */
 
 /* NID: 0xDB23E867 */
@@ -256,6 +299,24 @@ CellGcmDisplayInfo* cellGcmGetDisplayBufferByFlipIndex(u32 index);
 /* NID: 0x8BADE8BE */
 u32 cellGcmGetCurrentDisplayBufferId(void);
 
+/* Host-side coherent flip publication/consumption. `take` consumes exactly
+ * one pending SetFlip ticket; `consumed_snapshot` is the ticket currently
+ * owning the FIFO batch being drained. */
+int cellGcm_take_flip_ticket(CellGcmFlipTicket* out_ticket);
+int cellGcm_take_flip_ticket_timed(CellGcmFlipTicket* out_ticket,
+                                   CellGcmFlipPublicationTiming* out_timing);
+int cellGcm_flip_consumed_ticket_snapshot(CellGcmFlipTicket* out_ticket);
+/* After presentation, complete exactly the ticket taken by this host driver.
+ * Returns zero for an invalid, stale or already completed ticket. */
+int cellGcm_complete_flip_ticket(const CellGcmFlipTicket* ticket);
+int cellGcm_flip_uses_vsync(void);
+
+/* Optional host-owned interrupt thread. Register before guest execution and
+ * unregister after its final drain. A zero id preserves cooperative pumping.
+ * The wake hook only signals the dispatcher; it must not execute guest code. */
+typedef void (*CellGcmInterruptWake)(void);
+void cellGcmSetHostInterruptDispatcher(u32 host_thread_id, CellGcmInterruptWake wake);
+
 /* NID: 0xD9B7653E */
 void cellGcmSetFlipHandler(CellGcmFlipHandler handler);
 
@@ -291,6 +352,7 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset);
 
 /* NID: 0x5A41C10F */
 s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size);
+s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags);
 
 /* NID: 0xDB23E867 (disambiguation by context) */
 s32 cellGcmUnmapEaIoAddress(u32 ea);
@@ -300,6 +362,10 @@ s32 cellGcmUnmapIoAddress(u32 io);
 
 /* NID: 0xC47D0812 */
 s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32* ea);
+
+/* Internal location-aware translation.  Unlike the legacy value-only helper,
+ * this reports an unmapped MAIN IO page without conflating it with EA zero. */
+int cellGcmResolveLocatedChecked(int local, u32 offset, u32* out);
 
 /* Label / report / timestamp */
 
@@ -351,10 +417,10 @@ s32 cellGcmSetTileInfo(u8 index, u8 location, u32 offset, u32 size,
                        u32 pitch, u8 comp, u16 base, u8 bank);
 
 /* Notify data area (similar to report data) */
-void* cellGcmGetNotifyDataAddress(u32 index);
+u32 cellGcmGetNotifyDataAddress(u32 index);
 
-/* Timestamp location query */
-u32 cellGcmGetTimeStampLocation(u32 index, u32* location);
+/* Timestamp read from the selected report-data location */
+u64 cellGcmGetTimeStampLocation(u32 index, u32 location);
 
 /* Default FIFO size configuration */
 s32 cellGcmSetDefaultFifoSize(u32 size);
@@ -388,6 +454,20 @@ CellGcmZcullInfo* cellGcmGetZcullInfo(u8 index);
 
 /* Display info by index */
 CellGcmDisplayInfo* cellGcmGetDisplayInfo(u32 index);
+
+/* Backend display identity lookup. Matches an exact registered surface, or a
+ * strictly proven next-equal-stride history surface, and returns its geometry. */
+int cellGcmGetDisplaySurfaceInfo(u32 offset, u32 pitch, u32 width, u32 height,
+                                 CellGcmDisplayInfo* out_info);
+/* Strict unregistered next-stride history alias -> its two registered parent
+ * identities. Used only by deferred backend ownership resolution. */
+int cellGcmGetDisplayHistoryAliasParents(u32 offset, u32 pitch, u32 width,
+                                         u32 height,
+                                         CellGcmDisplayInfo* out_first,
+                                         CellGcmDisplayInfo* out_second);
+int cellGcmGetDisplaySurfaceContaining(u32 offset, u32 pitch, u32 width, u32 height,
+                                       CellGcmDisplayInfo* out_info,
+                                       u32* out_x, u32* out_y);
 
 /* Default FIFO mode / command buffer */
 void cellGcmInitDefaultFifoMode(s32 mode);

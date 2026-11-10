@@ -44,6 +44,7 @@ extern uint8_t* vm_base;
  * -----------------------------------------------------------------------*/
 
 static int s_http_initialized = 0;
+static int s_cookie_initialized = 0;
 #ifdef _WIN32
 static int s_wsa_initialized = 0;
 #endif
@@ -326,6 +327,30 @@ s32 cellHttpEnd(void)
     }
 #endif
 
+    return CELL_OK;
+}
+
+s32 cellHttpInitCookie(void* pool, u32 poolSize)
+{
+    printf("[cellHttp] InitCookie(pool=%p, poolSize=%u)\n", pool, poolSize);
+
+    if (!pool || !poolSize)
+        return CELL_HTTP_ERROR_NO_BUFFER;
+    if (s_cookie_initialized)
+        return CELL_HTTP_ERROR_ALREADY_INITIALIZED;
+
+    s_cookie_initialized = 1;
+    return CELL_OK;
+}
+
+s32 cellHttpEndCookie(void)
+{
+    printf("[cellHttp] EndCookie()\n");
+
+    if (!s_cookie_initialized)
+        return CELL_HTTP_ERROR_NOT_INITIALIZED;
+
+    s_cookie_initialized = 0;
     return CELL_OK;
 }
 

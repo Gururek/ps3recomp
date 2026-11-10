@@ -46,12 +46,19 @@ typedef struct {
     const char* name;            /* symbol name (for diagnostics) */
 } prx_func_entry;
 
-/* One exported symbol: a NID and the OPD/function vaddr it points at, both
- * base-0 as read from the PRX export table. The loader rebases the vaddr to the
- * module's load base when it registers the export. */
+/* Static-table kind. Old two-field generated initializers leave kind at zero,
+ * which deliberately remains the function default. */
+typedef enum {
+    PRX_EXPORT_KIND_FUNCTION = 0,
+    PRX_EXPORT_KIND_VARIABLE = 1,
+} prx_export_kind;
+
+/* One exported symbol: a NID and base-0 target vaddr from the PRX export
+ * table. Functions target OPDs; variables target guest data. */
 typedef struct {
     uint32_t nid;          /* import/export hash */
-    uint32_t vaddr;        /* base-0 OPD vaddr (function) or data vaddr (var) */
+    uint32_t vaddr;
+    prx_export_kind kind;
 } prx_export;
 
 typedef struct {
@@ -110,6 +117,38 @@ uint8_t* prx_image_load_file(const char* path, uint32_t* out_size);
  * loaded module exports it.
  */
 uint32_t prx_resolve_export(uint32_t nid);
+
+/* Runtime registrations from sys_prx_register_library. Functions are visible
+ * to the normal NID dispatcher; variables remain separately queryable data. */
+typedef enum {
+    PRX_DYNAMIC_EXPORT_FUNCTION = 1,
+    PRX_DYNAMIC_EXPORT_VARIABLE = 2,
+} prx_dynamic_export_kind;
+
+typedef struct {
+    uint32_t nid;
+    uint32_t guest_addr; /* OPD for functions, data address for variables */
+    prx_dynamic_export_kind kind;
+} prx_dynamic_export;
+
+enum {
+    PRX_DYNAMIC_REGISTER_OK = 0,
+    PRX_DYNAMIC_REGISTER_INVAL = -1,
+    PRX_DYNAMIC_REGISTER_FULL = -2,
+};
+
+/* Publish a complete owner set atomically. Existing NIDs keep the loader's
+ * last-writer-wins rule. A failed call leaves this owner unpublished. */
+int prx_register_dynamic_exports(uint64_t owner,
+                                 const prx_dynamic_export* exports,
+                                 uint32_t export_count);
+
+/* Remove all dynamic exports belonging to owner; returns removed entries. */
+uint32_t prx_unregister_dynamic_owner(uint64_t owner);
+
+/* Data-only resolver. Callers must not route this through the function HLE
+ * dispatcher because a variable address is not an OPD. */
+uint32_t prx_resolve_variable_export(uint32_t nid);
 
 /* Number of exports currently registered (diagnostics/tests). */
 uint32_t prx_export_registry_count(void);

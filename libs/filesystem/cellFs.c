@@ -146,6 +146,9 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 #endif
     }
 
+    extern void ps3_vfs_ps3game_fallback(char* path, size_t cap);
+    ps3_vfs_ps3game_fallback(host_buf, buf_size);
+
     return 0;
 }
 

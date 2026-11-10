@@ -98,6 +98,12 @@ s32 sys_process_is_spu_lock_line_reservation_address(u32 addr, u64 flags);
  * -----------------------------------------------------------------------*/
 
 s32 _sys_printf(const char* fmt, ...);
+s32 _sys_spu_printf_initialize(u32 agcb, u32 dgcb, u32 atcb, u32 dtcb);
+s32 _sys_spu_printf_finalize(void);
+extern u32 g_spu_printf_agcb;
+extern u32 g_spu_printf_dgcb;
+extern u32 g_spu_printf_atcb;
+extern u32 g_spu_printf_dtcb;
 s32 _sys_sprintf(char* buf, const char* fmt, ...);
 s32 _sys_snprintf(char* buf, u32 size, const char* fmt, ...);
 s32 _sys_strlen(const char* str);

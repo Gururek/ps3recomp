@@ -10,45 +10,192 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 /* The runtime's guest memory: host_ptr = vm_base + guest_addr. Declared by
  * runtime/memory/vm.h; we only need the symbol, so extern it directly to keep
  * the loader independent of the memory backend's init path. */
 extern uint8_t* vm_base;
 
 /* ---- export registry ---------------------------------------------------- *
- * Flat NID -> guest-address table, filled as modules load. A handful of system
- * PRXs export a few hundred symbols total, so a linear array with linear lookup
- * is plenty (lookups happen once per import resolution, not per call). */
-typedef struct { uint32_t nid; uint32_t guest_addr; } prx_export_reg_entry;
+ * Every writer is retained in order, so unloading/re-registering one dynamic
+ * owner exposes the preceding static or dynamic writer for the same NID/kind. */
+typedef struct {
+    uint32_t nid;
+    uint32_t guest_addr;
+    uint64_t owner;
+    prx_dynamic_export_kind kind;
+    uint64_t order;
+} prx_export_reg_entry;
 #define PRX_EXPORT_REG_CAP 2048
 static prx_export_reg_entry s_export_reg[PRX_EXPORT_REG_CAP];
 static uint32_t             s_export_reg_n = 0;
+static uint64_t             s_export_reg_order = 0;
 
-static void prx_export_register(uint32_t nid, uint32_t guest_addr)
+#ifdef _WIN32
+static SRWLOCK s_export_reg_lock = SRWLOCK_INIT;
+static void prx_export_lock(void) { AcquireSRWLockExclusive(&s_export_reg_lock); }
+static void prx_export_unlock(void) { ReleaseSRWLockExclusive(&s_export_reg_lock); }
+#else
+static pthread_mutex_t s_export_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+static void prx_export_lock(void) { pthread_mutex_lock(&s_export_reg_lock); }
+static void prx_export_unlock(void) { pthread_mutex_unlock(&s_export_reg_lock); }
+#endif
+
+static int prx_dynamic_export_valid(const prx_dynamic_export* e)
 {
-    /* Last writer wins if two modules export the same NID (matches the PS3
-     * loader's link order). Overwrite an existing entry rather than duplicate. */
+    return e && e->nid && e->guest_addr &&
+           (e->kind == PRX_DYNAMIC_EXPORT_FUNCTION ||
+            e->kind == PRX_DYNAMIC_EXPORT_VARIABLE);
+}
+
+static void prx_export_remove_owner_locked(uint64_t owner)
+{
+    uint32_t out = 0;
     for (uint32_t i = 0; i < s_export_reg_n; i++) {
-        if (s_export_reg[i].nid == nid) {
-            s_export_reg[i].guest_addr = guest_addr;
-            return;
-        }
+        if (s_export_reg[i].owner != owner)
+            s_export_reg[out++] = s_export_reg[i];
     }
-    if (s_export_reg_n < PRX_EXPORT_REG_CAP)
-        s_export_reg[s_export_reg_n++] = (prx_export_reg_entry){ nid, guest_addr };
-    else
+    s_export_reg_n = out;
+}
+
+static int prx_export_register_locked(uint64_t owner,
+                                      const prx_dynamic_export* export_entry)
+{
+    if (s_export_reg_n >= PRX_EXPORT_REG_CAP)
+        return 0;
+    s_export_reg[s_export_reg_n].nid = export_entry->nid;
+    s_export_reg[s_export_reg_n].guest_addr = export_entry->guest_addr;
+    s_export_reg[s_export_reg_n].owner = owner;
+    s_export_reg[s_export_reg_n].kind = export_entry->kind;
+    s_export_reg[s_export_reg_n].order = ++s_export_reg_order;
+    s_export_reg_n++;
+    return 1;
+}
+
+static void prx_export_register_static(uint32_t nid, uint32_t guest_addr,
+                                       prx_dynamic_export_kind kind)
+{
+    const prx_dynamic_export export_entry = {
+        nid, guest_addr, kind
+    };
+    if (!prx_dynamic_export_valid(&export_entry))
+        return;
+    prx_export_lock();
+    if (!prx_export_register_locked(0, &export_entry))
         fprintf(stderr, "[prx] export registry full, dropping NID 0x%08X\n", nid);
+    prx_export_unlock();
 }
 
 uint32_t prx_resolve_export(uint32_t nid)
 {
-    for (uint32_t i = 0; i < s_export_reg_n; i++)
-        if (s_export_reg[i].nid == nid)
-            return s_export_reg[i].guest_addr;
-    return 0;
+    uint32_t guest_addr = 0;
+    prx_export_lock();
+    uint64_t latest = 0;
+    for (uint32_t i = 0; i < s_export_reg_n; i++) {
+        if (s_export_reg[i].nid == nid &&
+            s_export_reg[i].kind == PRX_DYNAMIC_EXPORT_FUNCTION &&
+            s_export_reg[i].order > latest) {
+            latest = s_export_reg[i].order;
+            guest_addr = s_export_reg[i].guest_addr;
+        }
+    }
+    prx_export_unlock();
+    return guest_addr;
 }
 
-uint32_t prx_export_registry_count(void) { return s_export_reg_n; }
+uint32_t prx_resolve_variable_export(uint32_t nid)
+{
+    uint32_t guest_addr = 0;
+    prx_export_lock();
+    uint64_t latest = 0;
+    for (uint32_t i = 0; i < s_export_reg_n; i++) {
+        if (s_export_reg[i].nid == nid &&
+            s_export_reg[i].kind == PRX_DYNAMIC_EXPORT_VARIABLE &&
+            s_export_reg[i].order > latest) {
+            latest = s_export_reg[i].order;
+            guest_addr = s_export_reg[i].guest_addr;
+        }
+    }
+    prx_export_unlock();
+    return guest_addr;
+}
+
+int prx_register_dynamic_exports(uint64_t owner,
+                                 const prx_dynamic_export* exports,
+                                 uint32_t export_count)
+{
+    if (!owner || !exports || !export_count || export_count > PRX_EXPORT_REG_CAP)
+        return PRX_DYNAMIC_REGISTER_INVAL;
+    for (uint32_t i = 0; i < export_count; i++)
+        if (!prx_dynamic_export_valid(&exports[i]))
+            return PRX_DYNAMIC_REGISTER_INVAL;
+
+    prx_export_lock();
+    uint32_t owner_entries = 0;
+    for (uint32_t i = 0; i < s_export_reg_n; i++)
+        if (s_export_reg[i].owner == owner)
+            owner_entries++;
+
+    uint32_t needed_entries = 0;
+    for (uint32_t i = 0; i < export_count; i++) {
+        int superseded = 0;
+        for (uint32_t j = i + 1; j < export_count; j++) {
+            if (exports[j].nid == exports[i].nid && exports[j].kind == exports[i].kind) {
+                superseded = 1;
+                break;
+            }
+        }
+        if (!superseded)
+            needed_entries++;
+    }
+    if (s_export_reg_n - owner_entries + needed_entries > PRX_EXPORT_REG_CAP) {
+        prx_export_unlock();
+        return PRX_DYNAMIC_REGISTER_FULL;
+    }
+
+    /* Capacity and inputs were preflighted, so no partial owner can escape. */
+    prx_export_remove_owner_locked(owner);
+    for (uint32_t i = 0; i < export_count; i++) {
+        int superseded = 0;
+        for (uint32_t j = i + 1; j < export_count; j++) {
+            if (exports[j].nid == exports[i].nid && exports[j].kind == exports[i].kind) {
+                superseded = 1;
+                break;
+            }
+        }
+        if (!superseded)
+            (void)prx_export_register_locked(owner, &exports[i]);
+    }
+    prx_export_unlock();
+    return PRX_DYNAMIC_REGISTER_OK;
+}
+
+uint32_t prx_unregister_dynamic_owner(uint64_t owner)
+{
+    if (!owner)
+        return 0;
+    prx_export_lock();
+    const uint32_t before = s_export_reg_n;
+    prx_export_remove_owner_locked(owner);
+    const uint32_t removed = before - s_export_reg_n;
+    prx_export_unlock();
+    return removed;
+}
+
+uint32_t prx_export_registry_count(void)
+{
+    uint32_t count;
+    prx_export_lock();
+    count = s_export_reg_n;
+    prx_export_unlock();
+    return count;
+}
 
 prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
 {
@@ -97,7 +244,9 @@ prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
             const prx_export* e = &m->exports[i];
             if (e->nid == 0)
                 continue;
-            prx_export_register(e->nid, m->base + e->vaddr);
+            prx_export_register_static(e->nid, m->base + e->vaddr,
+                e->kind == PRX_EXPORT_KIND_VARIABLE
+                    ? PRX_DYNAMIC_EXPORT_VARIABLE : PRX_DYNAMIC_EXPORT_FUNCTION);
             exports_published++;
         }
     }

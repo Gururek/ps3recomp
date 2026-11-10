@@ -169,4 +169,61 @@ static inline uint8_t* sdata_decrypt(const uint8_t* d, size_t n, size_t* out_siz
     return out;
 }
 
+/* Decrypt a license-type-3 EDAT using the 16-byte KLicensee supplied by the
+ * title to sceNpDrmIsAvailable. This is the same per-block cipher as SDATA,
+ * but the KLicensee itself is the crypt key and FLAG_0x20 stores 0x20 bytes of
+ * metadata immediately before every encrypted block. Hash verification is
+ * intentionally separate from decryption; a wrong key yields unusable data
+ * and the title's own format check rejects it. */
+static inline uint8_t* edata_decrypt_klicense(const uint8_t* d, size_t n,
+                                              const uint8_t klicense[16],
+                                              size_t* out_size){
+    static const uint8_t EDAT_KEY_0[16]= {0xBE,0x95,0x9C,0xA8,0x30,0x8D,0xEF,0xA2,0xE5,0xE1,0x80,0xC6,0x37,0x12,0xA9,0xAE};
+    static const uint8_t ZERO_IV[16]   = {0};
+    if(!d || !klicense || !out_size || n < 0x100 ||
+       d[0]!='N' || d[1]!='P' || d[2]!='D') return NULL;
+    uint32_t version = sd_be32(d + 0x04);
+    uint32_t license = sd_be32(d + 0x08);
+    const uint8_t* digest   = d + 0x40;
+    const uint8_t* dev_hash = d + 0x60;
+    uint32_t flags      = sd_be32(d + 0x80);
+    uint32_t block_size = sd_be32(d + 0x84);
+    uint64_t file_size  = sd_be64(d + 0x88);
+    if((flags & 0x01000000u) || (license & 3u) != 3u) return NULL;
+    if(block_size == 0 || file_size == 0 || file_size > (uint64_t)n) return NULL;
+    if(flags & 0x01u) return NULL; /* compressed metadata needs decompression */
+
+    uint64_t total_blocks = (file_size + block_size - 1) / block_size;
+    uint8_t* out = (uint8_t*)malloc((size_t)file_size + 16);
+    if(!out) return NULL;
+    size_t written = 0;
+    for(uint64_t bn=0; bn<total_blocks; bn++){
+        uint32_t length = block_size;
+        if(bn==total_blocks-1 && (file_size % block_size)) length=(uint32_t)(file_size % block_size);
+        uint32_t padlen = (length + 15u) & ~15u;
+        uint64_t off;
+        if(flags & 0x20u)
+            off = 0x100u + bn * ((uint64_t)block_size + 0x20u) + 0x20u;
+        else
+            off = 0x100u + total_blocks * 0x10u + bn * (uint64_t)block_size;
+        if(off + padlen > n){ free(out); return NULL; }
+
+        uint8_t b_key[16] = {0};
+        if(version > 1) memcpy(b_key, dev_hash, 12);
+        b_key[12]=(uint8_t)(bn>>24); b_key[13]=(uint8_t)(bn>>16);
+        b_key[14]=(uint8_t)(bn>>8);  b_key[15]=(uint8_t)bn;
+        uint8_t rk[176]; sd_key_expand(klicense, rk);
+        uint8_t key_result[16]; sd_encrypt_block(rk, b_key, key_result);
+        uint8_t key_final[16];
+        if(flags & 0x08u) sd_cbc_decrypt(EDAT_KEY_0, ZERO_IV, key_result, key_final, 16);
+        else              memcpy(key_final, key_result, 16);
+        if(flags & 0x02u) memcpy(out + written, d + off, length);
+        else              sd_cbc_decrypt(key_final, version <= 1 ? ZERO_IV : digest,
+                                         d + off, out + written, padlen);
+        written += length;
+    }
+    *out_size = (size_t)file_size;
+    return out;
+}
+
 #endif /* SDATA_DECRYPT_H */

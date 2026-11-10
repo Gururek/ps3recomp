@@ -1,12 +1,12 @@
 /*
  * ps3recomp - cellResc HLE implementation
  *
- * Resolution scaling stub. Since the recompiled game renders through
- * the host GPU, actual rescaling is handled by the host graphics API.
- * This module tracks state so game code that queries RESC works correctly.
+ * Resolution scaling bridge. The host present path performs the final scale,
+ * but RESC still owns source registration, flip submission and flip state.
  */
 
 #include "cellResc.h"
+#include "cellGcmSys.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -16,16 +16,22 @@
 
 static int s_initialized = 0;
 static CellRescInitConfig s_config;
-static u32 s_display_mode = CELL_RESC_1280x720;
+static u32 s_display_mode = 0;
 static CellRescSrc s_src[8]; /* up to 8 color buffers */
+static u8 s_src_set[8];
 static CellRescDsts s_dsts[4]; /* one per display mode */
-static void (*s_flip_handler)(u32) = NULL;
-static void (*s_vblank_handler)(u32) = NULL;
-static s32 s_flip_status = 0;
-static u64 s_last_flip_time = 0;
+static uintptr_t s_color_buffer_ea = 0;
+static uintptr_t s_vertex_buffer_ea = 0;
+static uintptr_t s_fragment_buffer_ea = 0;
 static float s_aspect_h = 1.0f;
 static float s_aspect_v = 1.0f;
 static float s_pal_ratio = 0.5f;
+
+static int resc_valid_display_mode(u32 mode)
+{
+    return mode == CELL_RESC_720x480 || mode == CELL_RESC_720x576 ||
+           mode == CELL_RESC_1280x720 || mode == CELL_RESC_1920x1080;
+}
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -38,16 +44,17 @@ s32 cellRescInit(const CellRescInitConfig* initConfig)
     if (s_initialized)
         return (s32)CELL_RESC_ERROR_REINITIALIZED;
 
-    if (!initConfig)
+    if (!initConfig || initConfig->size > sizeof(CellRescInitConfig))
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
     s_config = *initConfig;
     memset(s_src, 0, sizeof(s_src));
+    memset(s_src_set, 0, sizeof(s_src_set));
     memset(s_dsts, 0, sizeof(s_dsts));
-    s_flip_handler = NULL;
-    s_vblank_handler = NULL;
-    s_flip_status = 0;
-    s_last_flip_time = 0;
+    s_display_mode = 0;
+    s_color_buffer_ea = 0;
+    s_vertex_buffer_ea = 0;
+    s_fragment_buffer_ea = 0;
     s_aspect_h = 1.0f;
     s_aspect_v = 1.0f;
     s_initialized = 1;
@@ -57,6 +64,8 @@ s32 cellRescInit(const CellRescInitConfig* initConfig)
 void cellRescExit(void)
 {
     printf("[cellResc] Exit()\n");
+    cellGcmSetFlipHandler(NULL);
+    cellGcmSetVBlankHandler(NULL);
     s_initialized = 0;
 }
 
@@ -67,29 +76,37 @@ s32 cellRescSetDisplayMode(u32 displayMode)
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
 
+    if (!resc_valid_display_mode(displayMode) ||
+        !(s_config.supportModes & displayMode))
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+
+    if (displayMode == CELL_RESC_720x576) {
+        const u32 temporal = s_config.palTemporalMode;
+        if (((temporal >= CELL_RESC_PAL_60_DROP &&
+              temporal <= CELL_RESC_PAL_60_INTERPOLATE_DROP_FLEXIBLE) &&
+             s_config.flipMode == CELL_RESC_DISPLAY_HSYNC) ||
+            (temporal == CELL_RESC_PAL_60_FOR_HSYNC &&
+             s_config.flipMode == CELL_RESC_DISPLAY_VSYNC))
+            return (s32)CELL_RESC_ERROR_BAD_COMBINATION;
+    }
+
     s_display_mode = displayMode;
     return CELL_OK;
 }
 
-s32 cellRescGetNumColorBuffers(u32 displayMode, u32 palTemporalMode, u32* numBufs)
+s32 cellRescGetNumColorBuffers(u32 displayMode, u32 palTemporalMode, s32 reserved)
 {
-    (void)displayMode;
-
-    if (!numBufs)
+    if (reserved != 0)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    /* PAL interpolation modes need extra buffers */
-    switch (palTemporalMode) {
-    case CELL_RESC_PAL_60_INTERPOLATE:
-    case CELL_RESC_PAL_60_INTERPOLATE_30_DROP:
-    case CELL_RESC_PAL_60_INTERPOLATE_DROP_FLEXIBLE:
-        *numBufs = 6;
-        break;
-    default:
-        *numBufs = 2;
-        break;
+    if (displayMode == CELL_RESC_720x576) {
+        if (palTemporalMode >= CELL_RESC_PAL_60_INTERPOLATE &&
+            palTemporalMode <= CELL_RESC_PAL_60_INTERPOLATE_DROP_FLEXIBLE)
+            return 6;
+        if (palTemporalMode == CELL_RESC_PAL_60_DROP)
+            return 3;
     }
-    return CELL_OK;
+    return 2;
 }
 
 s32 cellRescGetBufferSize(u32* colorBufSize, u32* vertexBufSize, u32* fragmentBufSize)
@@ -110,16 +127,20 @@ s32 cellRescGetBufferSize(u32* colorBufSize, u32* vertexBufSize, u32* fragmentBu
 
 s32 cellRescSetBufferAddress(void* colorBuf, void* vertexBuf, void* fragmentBuf)
 {
-    (void)colorBuf;
-    (void)vertexBuf;
-    (void)fragmentBuf;
-
     printf("[cellResc] SetBufferAddress()\n");
 
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
 
-    /* In host-GPU mode we don't use these buffers directly */
+    if (!colorBuf || !vertexBuf || !fragmentBuf)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+    if (((uintptr_t)colorBuf & 127u) || ((uintptr_t)vertexBuf & 3u) ||
+        ((uintptr_t)fragmentBuf & 63u))
+        return (s32)CELL_RESC_ERROR_BAD_ALIGNMENT;
+
+    s_color_buffer_ea = (uintptr_t)colorBuf;
+    s_vertex_buffer_ea = (uintptr_t)vertexBuf;
+    s_fragment_buffer_ea = (uintptr_t)fragmentBuf;
     return CELL_OK;
 }
 
@@ -130,10 +151,12 @@ s32 cellRescSetSrc(s32 index, const CellRescSrc* src)
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
 
-    if (!src || index < 0 || index >= 8)
+    if (!src || index < 0 || index >= 8 || !src->width || !src->height ||
+        src->height > 4096 || !src->pitch)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
     s_src[index] = *src;
+    s_src_set[index] = 1;
     return CELL_OK;
 }
 
@@ -144,7 +167,7 @@ s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts)
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
 
-    if (!dsts)
+    if (!dsts || !resc_valid_display_mode(displayMode))
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
     /* Map display mode to index */
@@ -157,39 +180,49 @@ s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts)
     return CELL_OK;
 }
 
-s32 cellRescSetConvertAndFlip(s32 index)
+s32 cellRescSetConvertAndFlip(void* context, s32 index)
 {
-    (void)index;
-
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
+    if (index < 0 || index >= 8 || !s_src_set[index])
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    /* In recomp, the host GPU handles display -- we just track the flip */
-    s_flip_status = 0; /* flip complete */
-    s_last_flip_time++; /* monotonic counter, actual time comes from host */
+    const CellRescSrc* src = &s_src[index];
+    s32 rc = cellGcmSetDisplayBuffer((u32)index, src->offset, src->pitch,
+                                     src->width, src->height);
+    if (rc != CELL_OK)
+        return (s32)CELL_RESC_ERROR_GCM_FLIP_QUE_FULL;
 
-    if (s_flip_handler)
-        s_flip_handler(1);
+    (void)context; /* HLE submits immediately; no guest command words needed. */
+    rc = cellGcmSetFlipCommand((u32)index);
+    return rc == CELL_OK ? CELL_OK : (s32)CELL_RESC_ERROR_GCM_FLIP_QUE_FULL;
+}
 
+s32 cellRescSetWaitFlip(void* context)
+{
+    (void)context;
+    if (!s_initialized)
+        return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
+    cellGcmSetWaitFlip();
     return CELL_OK;
 }
 
-s32 cellRescSetFlipHandler(void (*handler)(u32))
+void cellRescSetFlipHandler(void (*handler)(u32))
 {
     printf("[cellResc] SetFlipHandler(%p)\n", (void*)(uintptr_t)handler);
-    s_flip_handler = handler;
-    return CELL_OK;
+    cellGcmSetFlipHandler((CellGcmFlipHandler)handler);
 }
 
-s32 cellRescSetVBlankHandler(void (*handler)(u32))
+void cellRescSetVBlankHandler(void (*handler)(u32))
 {
     printf("[cellResc] SetVBlankHandler(%p)\n", (void*)(uintptr_t)handler);
-    s_vblank_handler = handler;
-    return CELL_OK;
+    cellGcmSetVBlankHandler((CellGcmVBlankHandler)handler);
 }
 
 s32 cellRescGetDisplayMode(u32* displayMode)
 {
+    if (!s_initialized)
+        return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
     if (!displayMode)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
@@ -197,38 +230,28 @@ s32 cellRescGetDisplayMode(u32* displayMode)
     return CELL_OK;
 }
 
-s32 cellRescGetLastFlipTime(u64* time)
+u64 cellRescGetLastFlipTime(void)
 {
-    if (!time)
-        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
-
-    *time = s_last_flip_time;
-    return CELL_OK;
+    return cellGcmGetLastFlipTime();
 }
 
 void cellRescResetFlipStatus(void)
 {
-    s_flip_status = 1; /* waiting for next flip */
+    cellGcmResetFlipStatus();
 }
 
 s32 cellRescGetFlipStatus(void)
 {
-    /* Auto-complete pending flips when polled, so games don't stall
-     * waiting for events in the null renderer. */
-    if (s_flip_status == 1) {
-        s_flip_status = 0;
-        s_last_flip_time++;
-        if (s_flip_handler)
-            s_flip_handler(1);
-        if (s_vblank_handler)
-            s_vblank_handler(1);
-    }
-    return s_flip_status;
+    return (s32)cellGcmGetFlipStatus();
 }
 
 s32 cellRescSetPalInterpolateDropFlexRatio(float ratio)
 {
     printf("[cellResc] SetPalInterpolateDropFlexRatio(%.2f)\n", ratio);
+    if (!s_initialized)
+        return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
+    if (ratio < 0.0f || ratio > 1.0f)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
     s_pal_ratio = ratio;
     return CELL_OK;
 }
@@ -240,8 +263,10 @@ s32 cellRescCreateInterlaceTable(void* buf, float ea, u32 tableLen, s32 depth)
 
     printf("[cellResc] CreateInterlaceTable(len=%u, depth=%d)\n", tableLen, depth);
 
-    if (!buf)
+    if (!buf || ea <= 0.0f || tableLen == 0 || depth < 0 || depth > 1)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+    if (!s_display_mode)
+        return (s32)CELL_RESC_ERROR_BAD_COMBINATION;
 
     /* Fill with simple linear interpolation weights */
     float* table = (float*)buf;
@@ -257,6 +282,10 @@ s32 cellRescAdjustAspectRatio(float horizontal, float vertical)
 
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
+
+    if (horizontal < 0.5f || horizontal > 2.0f ||
+        vertical < 0.5f || vertical > 2.0f)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
     s_aspect_h = horizontal;
     s_aspect_v = vertical;

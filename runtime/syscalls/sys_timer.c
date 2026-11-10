@@ -5,6 +5,9 @@
 #include "sys_timer.h"
 #include "sys_event.h"
 #include "../memory/vm.h"
+#include "../memory/guest_world_rendezvous.h"
+#include "../ppu/ppu_memory.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -102,9 +105,75 @@ static void write_be64(uint32_t addr, uint64_t val)
  *
  * r3 = microseconds
  * -----------------------------------------------------------------------*/
+static void trace_tj_loading_wait(ppu_context* ctx, uint64_t usec)
+{
+    static int enabled = -1;
+    static int stack_dumped = 0;
+#ifdef _WIN32
+    static ULONGLONG last_sample_ms = 0;
+#else
+    static uint32_t sample_calls = 0;
+#endif
+    if (enabled < 0)
+        enabled = getenv("TJ_LOADING_WAIT_TRACE") ? 1 : 0;
+    if (!enabled || usec != 100 || (uint32_t)ctx->lr != 0x00213A2C)
+        return;
+
+    const uint32_t task = (uint32_t)ctx->gpr[31];
+    const uint32_t pending = task ? vm_read32(task + 0x198) : 0;
+    const uint64_t completed_at = task ? vm_read64(task + 0x1A0) : 0;
+    const uint32_t clock = vm_read32((uint32_t)ctx->gpr[2] + 0x1860);
+    const uint64_t current = clock ? vm_read64(clock + 0x18) : 0;
+    const uint32_t sgx_state = clock ? vm_read32(clock + 0x4) : 0;
+    const uint32_t output_blocked = clock ? vm_read32(clock + 0x1F0) : 0;
+    const uint32_t config_busy = clock ? vm_read32(clock + 0x2208) : 0;
+    uint32_t sp = (uint32_t)ctx->gpr[1];
+
+#ifdef _WIN32
+    const ULONGLONG sample_ms = GetTickCount64();
+    if (!last_sample_ms || sample_ms - last_sample_ms >= 1000) {
+        last_sample_ms = sample_ms;
+#else
+    if ((sample_calls++ % 10000u) == 0) {
+#endif
+        fprintf(stderr,
+            "[TJ-WAIT] task=0x%08X pending=%u current=%llu completed_at=%llu "
+            "threshold=%llu sgx=0x%08X state=%u output_blocked=%u "
+            "config_busy=%u sp=0x%08X lr=0x%08X ctr=0x%08X\n",
+            task, pending, (unsigned long long)current,
+            (unsigned long long)completed_at,
+            (unsigned long long)(completed_at + 3), clock, sgx_state,
+            output_blocked, config_busy, sp,
+            (uint32_t)ctx->lr, (uint32_t)ctx->ctr);
+    }
+
+    if (stack_dumped)
+        return;
+    stack_dumped = 1;
+
+    /* PPC64 ABI: each frame back-chain is at [sp], and that callee's saved
+     * return address is at caller_sp + 0x10.  Walking guest frames here keeps
+     * the native Windows/ucrt wait frames out of the diagnostic. */
+    for (unsigned frame = 0; frame < 32; ++frame) {
+        const uint64_t caller64 = vm_read64(sp);
+        if (caller64 > UINT32_MAX)
+            break;
+        const uint32_t caller = (uint32_t)caller64;
+        if (!caller || (caller & 0xFu) != 0 || caller <= sp || caller - sp > 0x100000u)
+            break;
+        const uint64_t return64 = vm_read64(caller + 0x10);
+        if (return64 > UINT32_MAX)
+            break;
+        fprintf(stderr, "[TJ-WAIT] frame=%u sp=0x%08X return=0x%08X\n",
+            frame, caller, (uint32_t)return64);
+        sp = caller;
+    }
+}
+
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+    trace_tj_loading_wait(ctx, usec);
     { static int n=0; if (n++ < 60) fprintf(stderr, "[WAIT] timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n",
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
     /* POLLSITE: resolve the host chain of the 1ms poller (LBP bringup) to
@@ -237,6 +306,7 @@ static void timer_send_event(sys_timer_info* t);
 static DWORD WINAPI timer_thread_proc(LPVOID param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
+    if (!guest_world_register_current("sys-timer")) return 0;
 
     while (t->running) {
         DWORD ms = (DWORD)(t->period_usec / 1000);
@@ -252,12 +322,14 @@ static DWORD WINAPI timer_thread_proc(LPVOID param)
         }
     }
 
+    guest_world_unregister_current();
     return 0;
 }
 #else
 static void* timer_thread_proc(void* param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
+    if (!guest_world_register_current("sys-timer")) return NULL;
 
     pthread_mutex_lock(&t->mtx);
     while (!t->stop_flag) {
@@ -281,6 +353,7 @@ static void* timer_thread_proc(void* param)
     }
     pthread_mutex_unlock(&t->mtx);
 
+    guest_world_unregister_current();
     return NULL;
 }
 #endif

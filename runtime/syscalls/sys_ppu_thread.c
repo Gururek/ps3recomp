@@ -4,6 +4,8 @@
 
 #include <stddef.h>
 #include "sys_ppu_thread.h"
+#include "../ppu/ppu_memory.h"
+#include "../memory/guest_world_rendezvous.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
@@ -50,6 +52,16 @@ static void table_unlock(void)
 #endif
 }
 
+/* Host guest-callback adapters share the worker stack region only through
+ * this entrypoint, under the same lock as sys_ppu_thread_create. */
+uint32_t ppu_thread_allocate_guest_stack(uint32_t stack_size)
+{
+    table_lock();
+    uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, stack_size);
+    table_unlock();
+    return base;
+}
+
 /* Find a free slot. Returns index or -1. Must be called under lock. */
 static int find_free_slot(void)
 {
@@ -79,7 +91,9 @@ static void* ppu_host_thread_proc(void* param)
 #endif
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
+    int guest_world_registered = guest_world_register_current("ppu-worker");
 
+    if (guest_world_registered) {
 #ifdef _WIN32
     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
      * main thread. Deep recompiled call chains DO overflow even a 256 MB stack
@@ -109,28 +123,62 @@ static void* ppu_host_thread_proc(void* param)
         fprintf(stderr, "[THREAD %llu] g_ppu_thread_entry_trampoline is NULL — thread is a no-op!\n",
                 (unsigned long long)info->ctx.thread_id);
     }
+    } else {
+        fprintf(stderr, "[THREAD %llu] guest-world registration failed; finishing without guest dispatch\n",
+                (unsigned long long)info->ctx.thread_id);
+    }
 
     /* Mark as finished */
     table_lock();
-    info->exit_status = (int64_t)info->ctx.gpr[3];
+    /* sys_ppu_thread_exit supplies an explicit status before unwinding out of
+     * guest code. A normal return still reports r3. */
+    if (!info->exit_requested)
+        info->exit_status = (int64_t)info->ctx.gpr[3];
 
     if (info->state == PPU_THREAD_STATE_DETACHED) {
-        /* Detached threads self-clean */
+        /* Detached threads have no joiner. Release their handles before making
+         * the slot reusable; after FREE is published this wrapper must never
+         * touch info again because create may immediately memset the slot. */
+#ifdef _WIN32
+        if (info->host_thread) CloseHandle(info->host_thread);
+        if (info->finish_event) CloseHandle(info->finish_event);
+        info->host_thread = NULL;
+        info->finish_event = NULL;
+#endif
         info->state = PPU_THREAD_STATE_FREE;
+        table_unlock();
+#ifdef _WIN32
+        if (guest_world_registered) guest_world_unregister_current();
+        return 0;
+#else
+        if (guest_world_registered) guest_world_unregister_current();
+        return NULL;
+#endif
     } else {
         info->state = PPU_THREAD_STATE_FINISHED;
     }
-    table_unlock();
 
-    /* Signal anyone waiting for join */
+    /* Publish completion while the table lock still owns this slot.  A joiner
+     * may wake and make it reusable as soon as the lock is released. */
 #ifdef _WIN32
-    SetEvent(info->finish_event);
+    {
+        BOOL signalled = SetEvent(info->finish_event);
+        fprintf(stderr,
+                "[THREAD %llu] publish FINISHED event=%p set=%d err=%lu\n",
+                (unsigned long long)info->ctx.thread_id,
+                (void*)info->finish_event, signalled ? 1 : 0,
+                signalled ? 0ul : (unsigned long)GetLastError());
+    }
+    table_unlock();
+    if (guest_world_registered) guest_world_unregister_current();
     return 0;
 #else
     pthread_mutex_lock(&info->finish_mutex);
     info->finished = 1;
     pthread_cond_signal(&info->finish_cond);
     pthread_mutex_unlock(&info->finish_mutex);
+    table_unlock();
+    if (guest_world_registered) guest_world_unregister_current();
     return NULL;
 #endif
 }
@@ -321,8 +369,16 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 
     /* Copy thread name if provided */
     if (name_addr != 0) {
-        const char* name = (const char*)vm_to_host(name_addr);
-        strncpy(t->name, name, sizeof(t->name) - 1);
+        /* The ABI supplies a guest EA. Copy one byte at a time so a missing
+         * terminator cannot make a host libc read escape the guest address
+         * space at the 32-bit wrap boundary. */
+        size_t i = 0;
+        for (; i + 1 < sizeof(t->name); ++i) {
+            if (name_addr > UINT32_MAX - (uint32_t)i) break;
+            char ch = (char)vm_read8(name_addr + (uint32_t)i);
+            t->name[i] = ch;
+            if (!ch) break;
+        }
         t->name[sizeof(t->name) - 1] = '\0';
     }
 
@@ -336,26 +392,28 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 #endif
 
     /* Write thread ID to output pointer */
-    if (tid_out_addr != 0) {
-        uint64_t* out = (uint64_t*)vm_to_host(tid_out_addr);
-        /* Store as big-endian u64 */
-        uint64_t be_id = thread_id;
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        be_id = ((be_id >> 56) & 0xFF) |
-                ((be_id >> 40) & 0xFF00) |
-                ((be_id >> 24) & 0xFF0000) |
-                ((be_id >>  8) & 0xFF000000ULL) |
-                ((be_id <<  8) & 0xFF00000000ULL) |
-                ((be_id << 24) & 0xFF0000000000ULL) |
-                ((be_id << 40) & 0xFF000000000000ULL) |
-                ((be_id << 56) & 0xFF00000000000000ULL);
-#endif
-        *out = be_id;
-    }
+    if (tid_out_addr != 0)
+        vm_write64(tid_out_addr, thread_id);
 
     fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
             (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
             stack_size, priority);
+    /* Opt-in startup descriptor snapshot. Tokyo Jungle's generic thread
+     * wrapper stores its callback OPD at +8 and callback argument at +0x10;
+     * preserving the raw words here identifies which loading routine actually
+     * ran without changing thread behavior. */
+    if (getenv("PPU_THREAD_START_TRACE") &&
+        strcmp(t->name, "loading_thread") == 0 &&
+        arg <= UINT32_MAX - 0x18u) {
+        uint32_t a = (uint32_t)arg;
+        fprintf(stderr,
+                "[PPU-START] tid=%llu arg=0x%08X opd=0x%08X wordC=0x%08X "
+                "user_arg=0x%llX active=%u\n",
+                (unsigned long long)thread_id, a,
+                vm_read32(a + 0x8), vm_read32(a + 0xC),
+                (unsigned long long)vm_read64(a + 0x10),
+                (unsigned)vm_read8(a + 0x18));
+    }
     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
      * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null
      * the worker dispatches its job on a null object -> construction never runs. */
@@ -430,26 +488,17 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     table_lock();
     ppu_thread_info* t = find_thread(tid);
     if (t) {
+        /* Record the requested status only. Completion belongs to
+         * ppu_host_thread_proc after the recompiled entry has truly returned.
+         * Signalling here let join free/reuse this slot while the old wrapper
+         * was still executing, corrupting the next thread's event/context. */
         t->exit_status = (int64_t)status;
-        if (t->state == PPU_THREAD_STATE_DETACHED) {
-            t->state = PPU_THREAD_STATE_FREE;
-        } else {
-            t->state = PPU_THREAD_STATE_FINISHED;
-        }
-
-#ifdef _WIN32
-        SetEvent(t->finish_event);
-#else
-        pthread_mutex_lock(&t->finish_mutex);
-        t->finished = 1;
-        pthread_cond_signal(&t->finish_cond);
-        pthread_mutex_unlock(&t->finish_mutex);
-#endif
+        t->exit_requested = 1;
     }
     table_unlock();
 
-    /* In a real implementation this would terminate the calling thread.
-     * The thread proc wrapper handles this after return. */
+    /* C callers only record the request. C++ syscall/HLE bridges throw the
+     * dedicated signal, and their guest-execution roots complete the unwind. */
     return CELL_OK;
 }
 
@@ -463,7 +512,10 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 {
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
-    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    { static int n=0; if(n++<200) fprintf(stderr,
+        "[WAIT] ppu_thread_join(tid=%llu lr=0x%08X sp=0x%08X cia=0x%08X)\n",
+        (unsigned long long)tid, (uint32_t)ctx->lr,
+        (uint32_t)ctx->gpr[1], (uint32_t)ctx->cia); }
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
@@ -471,21 +523,57 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
         table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    if (!t->joinable || t->state == PPU_THREAD_STATE_DETACHED) {
+    if (!t->joinable || t->state == PPU_THREAD_STATE_DETACHED || t->join_claimed) {
         table_unlock();
         return (int64_t)(int32_t)CELL_EINVAL;
+    }
+    t->join_claimed = 1;
+    if (getenv("TJ_JOIN_TRACE") && strstr(t->name, "loading_thread")) {
+        extern void ppu_dump_guest_stack(ppu_context*, const char*);
+        fprintf(stderr,
+                "[TJ-LOADING-JOIN] tid=%llu name=\"%s\" lr=0x%08X sp=0x%08X\n",
+                (unsigned long long)tid, t->name, (uint32_t)ctx->lr,
+                (uint32_t)ctx->gpr[1]);
+        ppu_dump_guest_stack(ctx, "loading-thread-join");
+        fflush(stderr);
     }
     table_unlock();
 
     /* Wait for completion */
 #ifdef _WIN32
-    WaitForSingleObject(t->finish_event, INFINITE);
+    fprintf(stderr,
+            "[JOIN %llu] waiting event=%p state=%d host=%p\n",
+            (unsigned long long)tid, (void*)t->finish_event,
+            (int)t->state, (void*)t->host_thread);
+    {
+        DWORD wait_rc = WaitForSingleObject(t->finish_event, INFINITE);
+        fprintf(stderr,
+                "[JOIN %llu] woke rc=0x%08lX err=%lu state=%d\n",
+                (unsigned long long)tid, (unsigned long)wait_rc,
+                wait_rc == WAIT_FAILED ? (unsigned long)GetLastError() : 0ul,
+                (int)t->state);
+        if (wait_rc != WAIT_OBJECT_0) {
+            table_lock();
+            if (find_thread(tid) == t && t->ctx.thread_id == tid && t->join_claimed)
+                t->join_claimed = 0;
+            table_unlock();
+            return (int64_t)(int32_t)CELL_ESRCH;
+        }
+    }
 #else
     pthread_mutex_lock(&t->finish_mutex);
-    while (!t->finished) {
-        pthread_cond_wait(&t->finish_cond, &t->finish_mutex);
+    int wait_rc = 0;
+    while (!t->finished && wait_rc == 0) {
+        wait_rc = pthread_cond_wait(&t->finish_cond, &t->finish_mutex);
     }
     pthread_mutex_unlock(&t->finish_mutex);
+    if (wait_rc != 0) {
+        table_lock();
+        if (find_thread(tid) == t && t->ctx.thread_id == tid && t->join_claimed)
+            t->join_claimed = 0;
+        table_unlock();
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
 #endif
 
     /* Write exit status */
@@ -510,6 +598,11 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 
     /* Clean up */
     table_lock();
+    if (find_thread(tid) != t || t->ctx.thread_id != tid ||
+        !t->join_claimed || t->state != PPU_THREAD_STATE_FINISHED) {
+        table_unlock();
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
 #ifdef _WIN32
     CloseHandle(t->host_thread);
     CloseHandle(t->finish_event);
@@ -520,11 +613,40 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     pthread_mutex_destroy(&t->finish_mutex);
     pthread_cond_destroy(&t->finish_cond);
 #endif
+    t->join_claimed = 0;
     t->state = PPU_THREAD_STATE_FREE;
     table_unlock();
 
+    fprintf(stderr, "[JOIN %llu] complete; slot released\n",
+            (unsigned long long)tid);
+
     return CELL_OK;
 }
+
+#ifdef _WIN32
+HANDLE ppu_thread_duplicate_live_worker(unsigned thread_id)
+{
+    HANDLE copy = NULL;
+    if (thread_id < 2 || thread_id > PPU_THREAD_MAX) return NULL;
+    table_lock();
+    ppu_thread_info* t = &g_ppu_threads[thread_id - 1];
+    if ((t->state == PPU_THREAD_STATE_RUNNING ||
+         t->state == PPU_THREAD_STATE_DETACHED) && t->host_thread) {
+        DuplicateHandle(GetCurrentProcess(), t->host_thread,
+                        GetCurrentProcess(), &copy, 0, FALSE,
+                        DUPLICATE_SAME_ACCESS);
+    }
+    table_unlock();
+    if (copy) {
+        DWORD exit_code = 0;
+        if (!GetExitCodeThread(copy, &exit_code) || exit_code != STILL_ACTIVE) {
+            CloseHandle(copy);
+            copy = NULL;
+        }
+    }
+    return copy;
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * sys_ppu_thread_detach
@@ -540,6 +662,11 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
     if (!t) {
         table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
+
+    if (!t->joinable || t->state == PPU_THREAD_STATE_DETACHED || t->join_claimed) {
+        table_unlock();
+        return (int64_t)(int32_t)CELL_EINVAL;
     }
 
     if (t->state == PPU_THREAD_STATE_FINISHED) {

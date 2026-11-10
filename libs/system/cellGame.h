@@ -150,6 +150,8 @@ s32 cellGameGetParamInt(s32 id, s32* value);
 
 s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize);
 
+s32 cellGameSetParamString(s32 id, const char* value);
+
 s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPath,
                             char* tmp_usrdirPath);
 

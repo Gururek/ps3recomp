@@ -84,6 +84,8 @@ typedef struct CellHttpUri {
 
 s32 cellHttpInit(void* pool, u32 poolSize);
 s32 cellHttpEnd(void);
+s32 cellHttpInitCookie(void* pool, u32 poolSize);
+s32 cellHttpEndCookie(void);
 
 s32 cellHttpCreateClient(CellHttpClientId* clientId);
 s32 cellHttpDestroyClient(CellHttpClientId clientId);

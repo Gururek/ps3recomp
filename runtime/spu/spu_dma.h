@@ -23,6 +23,8 @@
 #include <stdio.h>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <stdatomic.h>
 #endif
 
 #ifdef __cplusplus
@@ -30,6 +32,34 @@ extern "C" {
 #endif
 
 extern uint8_t* vm_base;
+
+/* Optional runtime callback seam for a successful image17 regular PUT. Keep
+ * it compile-time opt-in so standalone generated-code consumers gain neither
+ * a callback symbol nor a video-runtime dependency. */
+#ifdef PS3RECOMP_SPU_DMA_IMAGE17_CALLBACK
+typedef void (*spu_dma_image17_put_callback)(uint32_t cmd, uint32_t lsa,
+                                             uint32_t ea, uint32_t size,
+                                             uint32_t pc,
+                                             const uint8_t* copied_bytes);
+void spu_dma_set_image17_put_callback(spu_dma_image17_put_callback callback);
+spu_dma_image17_put_callback spu_dma_get_image17_put_callback(void);
+#endif
+
+/* Keep the central MAIN-write ordering gate opt-in: some standalone SPU
+ * helper tests consume this header without linking the full runtime. */
+#ifdef PS3RECOMP_SPU_MAIN_WRITE_GATE
+#include "spu_main_write_gate.h"
+#include "spu_reservation.h"   /* ordered PUT for job-chain lane windows */
+#endif
+
+static inline int mfc_ea_range_overlaps_reserved_hole(uint32_t ea, uint32_t size)
+{
+    const uint64_t begin = ea;
+    const uint64_t end = begin + size;
+    return (begin < 0x60000000ull && end > 0x50000000ull) ||
+           (begin < 0xC0000000ull && end > 0x70000000ull) ||
+           end > 0xE0000000ull;
+}
 
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
@@ -48,11 +78,34 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
      * measured that at 94 CPU-seconds in a 50 s movie run -- 60x the entire
      * lifted-SPU execution cost, and the real reason the Bink intro decoded
      * at 1-2 FPS. Bounds-check only. */
+    if (ea > UINT32_MAX) return 0;   /* PS3 SPU DMA effective addresses are 32-bit */
     uint32_t e = (uint32_t)ea;
     if (size == 0) return 0;
     if ((uint64_t)e + (uint64_t)size > 0x100000000ull) return 0;   /* past 4 GB */
+    /* Reserved holes in this runtime's guest map. They can never be valid DMA
+     * targets; rejecting them before the page cache also prevents a stale or
+     * corrupted cache bit from turning guest pointer corruption into host AV. */
+    if (mfc_ea_range_overlaps_reserved_hole(e, size))
+        return 0;
 #ifdef _WIN32
     if (!vm_base) return 0;
+    /* Stack guard pages are 4 KB subranges inside a precommitted 256 MB
+     * region. The 64 KB cache below cannot represent those protections, so
+     * walk the actual VirtualQuery regions for any stack DMA. */
+    if (e < 0xE0000000u && (uint64_t)e + size > 0xD0000000ull) {
+        uintptr_t cur = (uintptr_t)(vm_base + e);
+        uintptr_t end = cur + size;
+        while (cur < end) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery((const void*)cur, &mbi, sizeof mbi) == 0) return 0;
+            if (mbi.State != MEM_COMMIT ||
+                (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
+            uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            if (next <= cur) return 0;
+            cur = next;
+        }
+        return 1;
+    }
     /* Committed-page bitmap as a self-healing CACHE of VirtualQuery. The
      * demand-commit fault handler seeds it, but regions the host commits
      * directly (the D3D12 backend's VRAM window never faults) start unseeded
@@ -250,14 +303,144 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     if (!mfc_ea_range_committed(ea, size)) {
         static int s_warned = 0;
         if (s_warned++ < 32)
-            fprintf(stderr, "[spu-dma] SKIP %s lsa=0x%05X ea=0x%08X size=%u "
+            fprintf(stderr, "[spu-dma] SKIP %s img=%d pc=0x%05X lsa=0x%05X ea=0x%llX size=%u "
                     "(EA not committed -- bad/garbage DMA target)\n",
-                    mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size);
+                    mfc_is_get(cmd) ? "GET" : "PUT", spu->image_id,
+                    (uint32_t)spu->pc & SPU_LS_MASK, lsa,
+                    (unsigned long long)ea, size);
         return -1;
     }
 
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea; /* PS3 uses 32-bit effective addresses for SPU DMA */
+
+    /* YDKJ_DMA_DUMP_IMG=N: dump the first 32 PUT-family transfers issued by
+     * image N. Source bytes are read from LS before the PUT copies them to EA,
+     * so this shows the exact geometry payload handed to RSX without enabling
+     * the uncapped, all-transfer YDKJ_DMATRACE path. */
+    {
+#ifdef _WIN32
+      static volatile LONG s_dump_img_state = 0, s_dump_img = -1, s_dump_count = 0;
+      if (InterlockedCompareExchange(&s_dump_img_state, 0, 0) != 2) {
+          if (InterlockedCompareExchange(&s_dump_img_state, 1, 0) == 0) {
+              const char* e = getenv("YDKJ_DMA_DUMP_IMG");
+              InterlockedExchange(&s_dump_img, e ? atoi(e) : -1);
+              InterlockedExchange(&s_dump_img_state, 2);
+          } else {
+              while (InterlockedCompareExchange(&s_dump_img_state, 2, 2) != 2) { }
+          }
+      }
+      if (spu->image_id == InterlockedCompareExchange(&s_dump_img, 0, 0) && mfc_is_put(cmd)) {
+          LONG ticket;
+          do {
+              ticket = InterlockedCompareExchange(&s_dump_count, 0, 0);
+              if (ticket >= 32) break;
+          } while (InterlockedCompareExchange(&s_dump_count, ticket + 1, ticket) != ticket);
+          if (ticket < 32) {
+#else
+      static atomic_int s_dump_img_state = ATOMIC_VAR_INIT(0);
+      static atomic_int s_dump_img = ATOMIC_VAR_INIT(-1);
+      static atomic_uint s_dump_count = ATOMIC_VAR_INIT(0);
+      if (atomic_load_explicit(&s_dump_img_state, memory_order_acquire) != 2) {
+          int expected = 0;
+          if (atomic_compare_exchange_strong_explicit(&s_dump_img_state, &expected, 1,
+                                                      memory_order_acq_rel, memory_order_acquire)) {
+              const char* e = getenv("YDKJ_DMA_DUMP_IMG");
+              atomic_store_explicit(&s_dump_img, e ? atoi(e) : -1, memory_order_relaxed);
+              atomic_store_explicit(&s_dump_img_state, 2, memory_order_release);
+          } else {
+              while (atomic_load_explicit(&s_dump_img_state, memory_order_acquire) != 2) { }
+          }
+      }
+      if (spu->image_id == atomic_load_explicit(&s_dump_img, memory_order_relaxed) && mfc_is_put(cmd)) {
+          unsigned ticket = atomic_load_explicit(&s_dump_count, memory_order_relaxed);
+          while (ticket < 32 &&
+                 !atomic_compare_exchange_weak_explicit(&s_dump_count, &ticket, ticket + 1,
+                                                        memory_order_acq_rel, memory_order_relaxed)) { }
+          if (ticket < 32) {
+#endif
+              uint32_t dump_size = size < 64 ? size : 64;
+              char line[384];
+              int header = snprintf(line, sizeof line,
+                  "[ydkj-dma-dump] op=0x%02X lsa=0x%05X ea=0x%08X size=0x%X img=%d pc=0x%05X bytes=",
+                  cmd, lsa, (uint32_t)ea, size, spu->image_id,
+                  (uint32_t)spu->pc & SPU_LS_MASK);
+              size_t used = header > 0 && (size_t)header < sizeof line ? (size_t)header : 0;
+              static const char hex[] = "0123456789ABCDEF";
+              for (uint32_t i = 0; i < dump_size && used + 3 < sizeof line; i++) {
+                  if (i != 0 && (i & 3) == 0) line[used++] = ' ';
+                  line[used++] = hex[ls_ptr[i] >> 4];
+                  line[used++] = hex[ls_ptr[i] & 0x0F];
+              }
+              line[used++] = '\n';
+              fwrite(line, 1, used, stderr);
+              fflush(stderr);
+          }
+      }
+    }
+
+    /* YDKJ_DMA_EA=<guest address>: trace transfers touching one exact guest
+     * address, regardless of image or how late the job runs. */
+    {
+#ifdef _WIN32
+      static volatile LONG s_watch_ea_state = 0, s_watch_count = 0;
+      static volatile LONG64 s_watch_ea = -1;
+      if (InterlockedCompareExchange(&s_watch_ea_state, 0, 0) != 2) {
+          if (InterlockedCompareExchange(&s_watch_ea_state, 1, 0) == 0) {
+              const char* e = getenv("YDKJ_DMA_EA");
+              InterlockedExchange64(&s_watch_ea, e ? (LONG64)strtoul(e, NULL, 0) : -1);
+              InterlockedExchange(&s_watch_ea_state, 2);
+          } else {
+              while (InterlockedCompareExchange(&s_watch_ea_state, 2, 2) != 2) { }
+          }
+      }
+      int64_t watch_ea = (int64_t)InterlockedCompareExchange64(&s_watch_ea, 0, 0);
+#else
+      static atomic_int s_watch_ea_state = ATOMIC_VAR_INIT(0);
+      static atomic_llong s_watch_ea = ATOMIC_VAR_INIT(-1);
+      static atomic_uint s_watch_count = ATOMIC_VAR_INIT(0);
+      if (atomic_load_explicit(&s_watch_ea_state, memory_order_acquire) != 2) {
+          int expected = 0;
+          if (atomic_compare_exchange_strong_explicit(&s_watch_ea_state, &expected, 1,
+                                                      memory_order_acq_rel, memory_order_acquire)) {
+              const char* e = getenv("YDKJ_DMA_EA");
+              atomic_store_explicit(&s_watch_ea, e ? (long long)strtoul(e, NULL, 0) : -1,
+                                    memory_order_relaxed);
+              atomic_store_explicit(&s_watch_ea_state, 2, memory_order_release);
+          } else {
+              while (atomic_load_explicit(&s_watch_ea_state, memory_order_acquire) != 2) { }
+          }
+      }
+      int64_t watch_ea = (int64_t)atomic_load_explicit(&s_watch_ea, memory_order_relaxed);
+#endif
+      if (watch_ea >= 0 && (uint64_t)watch_ea >= ea &&
+          (uint64_t)watch_ea < ea + size) {
+#ifdef _WIN32
+          LONG ticket;
+          do {
+              ticket = InterlockedCompareExchange(&s_watch_count, 0, 0);
+              if (ticket >= 200) break;
+          } while (InterlockedCompareExchange(&s_watch_count, ticket + 1, ticket) != ticket);
+          if (ticket < 200) {
+#else
+          unsigned ticket = atomic_load_explicit(&s_watch_count, memory_order_relaxed);
+          while (ticket < 200 &&
+                 !atomic_compare_exchange_weak_explicit(&s_watch_count, &ticket, ticket + 1,
+                                                        memory_order_acq_rel, memory_order_relaxed)) { }
+          if (ticket < 200) {
+#endif
+              uint32_t o = (uint32_t)((uint64_t)watch_ea - ea);
+              fprintf(stderr,
+                      "[dma-ea-watch] %s ea=0x%08X+0x%X lsa=0x%05X size=%u img=%d pc=0x%05X bytes=%02X%02X%02X%02X\n",
+                      mfc_is_get(cmd) ? "GET" : "PUT", (uint32_t)ea, o, lsa,
+                      size, spu->image_id, (uint32_t)spu->pc,
+                      ls_ptr[o], o + 1 < size ? ls_ptr[o + 1] : 0,
+                      o + 2 < size ? ls_ptr[o + 2] : 0,
+                      o + 3 < size ? ls_ptr[o + 3] : 0);
+              fflush(stderr);
+          }
+      }
+    }
 
     /* SPU_STACKEA_WATCH=1: the LBP JobManagerWorker completion protocol hands the
      * SPU job a completion-word EA (param[4]) that lives on the PPU stack
@@ -404,7 +587,30 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
     } else if (mfc_is_put(cmd)) {
         /* PUT: local store -> main memory */
+#ifdef PS3RECOMP_SPU_MAIN_WRITE_GATE
+        const uint64_t main_write_gate_token =
+            spu_main_write_gate_writer_enter((uint32_t)ea, size);
+        if (!main_write_gate_token)
+            return -1;
+        /* Lane window job: copy under the reservation lock and kill
+         * reservations on the touched lines, as a hardware PUT would, so a
+         * sibling job's PUTLLC cannot commit over these bytes. */
+        if (spu_reservation_put_ordered())
+            spu_reservation_put_copy((uint32_t)ea, ea_ptr, ls_ptr, size);
+        else
+#endif
         memcpy(ea_ptr, ls_ptr, size);
+#ifdef PS3RECOMP_SPU_MAIN_WRITE_GATE
+        spu_main_write_gate_writer_exit(main_write_gate_token);
+#endif
+#ifdef PS3RECOMP_SPU_DMA_IMAGE17_CALLBACK
+        if (spu->image_id == 17) {
+            spu_dma_image17_put_callback callback = spu_dma_get_image17_put_callback();
+            if (callback)
+                callback(cmd, lsa, (uint32_t)ea, size,
+                         (uint32_t)spu->pc & SPU_LS_MASK, (const uint8_t*)ls_ptr);
+        }
+#endif
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;
@@ -426,7 +632,45 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
          * memcpy bypasses vm_write32/AWATCH, so it's the prime suspect for the
          * garbage fn-ptr fields that cause the 0xC708C708 vcall crash. */
-        { uint32_t e = (uint32_t)ea;
+        {
+#ifdef _WIN32
+          static volatile LONG s_poison_watch_state = 0;
+          static volatile LONG s_poison_watch = 0;
+          static volatile LONG s_poison_count = 0;
+          if (InterlockedCompareExchange(&s_poison_watch_state, 0, 0) != 2) {
+              if (InterlockedCompareExchange(&s_poison_watch_state, 1, 0) == 0) {
+                  InterlockedExchange(&s_poison_watch,
+                                      getenv("SPU_POISON_DMA_WATCH") ? 1 : 0);
+                  InterlockedExchange(&s_poison_watch_state, 2);
+              } else {
+                  while (InterlockedCompareExchange(&s_poison_watch_state, 2, 2) != 2) { }
+              }
+          }
+          const int poison_watch =
+              InterlockedCompareExchange(&s_poison_watch, 0, 0) != 0;
+#else
+          static atomic_int s_poison_watch_state = ATOMIC_VAR_INIT(0);
+          static atomic_int s_poison_watch = ATOMIC_VAR_INIT(0);
+          static atomic_uint s_poison_count = ATOMIC_VAR_INIT(0);
+          if (atomic_load_explicit(&s_poison_watch_state, memory_order_acquire) != 2) {
+              int expected = 0;
+              if (atomic_compare_exchange_strong_explicit(
+                      &s_poison_watch_state, &expected, 1,
+                      memory_order_acq_rel, memory_order_acquire)) {
+                  atomic_store_explicit(&s_poison_watch,
+                                        getenv("SPU_POISON_DMA_WATCH") ? 1 : 0,
+                                        memory_order_relaxed);
+                  atomic_store_explicit(&s_poison_watch_state, 2,
+                                        memory_order_release);
+              } else {
+                  while (atomic_load_explicit(&s_poison_watch_state,
+                                              memory_order_acquire) != 2) { }
+              }
+          }
+          const int poison_watch =
+              atomic_load_explicit(&s_poison_watch, memory_order_relaxed) != 0;
+#endif
+          if (poison_watch) { uint32_t e = (uint32_t)ea;
           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
           int haspoison = 0;
           for (uint32_t o = 0; o + 4 <= size; o += 4) {
@@ -434,11 +678,16 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               if (w == 0x08C708C7u) { haspoison = 1; break; } /* 0xC708C708 BE in LS bytes */
           }
           if (hitregion || haspoison) {
-              static int _n = 0;
-              if (_n++ < 12)
+#ifdef _WIN32
+              LONG ticket = InterlockedIncrement(&s_poison_count) - 1;
+#else
+              unsigned ticket = atomic_fetch_add_explicit(&s_poison_count, 1,
+                                                          memory_order_relaxed);
+#endif
+              if (ticket < 12)
                   fprintf(stderr, "[POISON-DMA] img%u PUT ea=0x%08X size=0x%X lsa=0x%X hitregion=%d haspoison=%d\n",
                           spu->image_id, e, size, lsa, hitregion, haspoison);
-          } }
+          } } }
     }
 
     return 0;

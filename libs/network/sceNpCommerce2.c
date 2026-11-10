@@ -8,6 +8,10 @@
 #include "sceNpCommerce2.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+
+extern void vm_write32(unsigned long long ea, unsigned int value);
+extern uint32_t ppu_vm_size;
 
 static int s_initialized = 0;
 
@@ -30,15 +34,23 @@ s32 sceNpCommerce2Term(void)
 }
 
 s32 sceNpCommerce2CreateCtx(u32 version, const void* npId,
+                              const void* handler, const void* arg,
                               SceNpCommerce2Context* ctx)
 {
+    /* The firmware's callback and userdata precede the output pointer.
+     * Offline requests do not dispatch that callback, but it must never be
+     * mistaken for the context output and overwritten. */
+    (void)npId; (void)handler; (void)arg;
     printf("[sceNpCommerce2] CreateCtx(version=%u)\n", version);
-    if (!ctx) return SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT;
+    const u32 ctx_ea = (u32)(uintptr_t)ctx;
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : (UINT64_C(1) << 32);
+    if (!ctx_ea || (uint64_t)ctx_ea + 4 > limit)
+        return SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT;
 
     for (int i = 0; i < MAX_CTX; i++) {
         if (!s_ctx_in_use[i]) {
             s_ctx_in_use[i] = 1;
-            *ctx = (u32)i;
+            vm_write32(ctx_ea, (u32)i);
             return CELL_OK;
         }
     }

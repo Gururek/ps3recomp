@@ -24,6 +24,7 @@
  */
 #include "spu_context.h"
 #include "spu_workload.h"
+#include "../memory/guest_world_rendezvous.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -416,11 +417,12 @@ extern void tsp_spu_func_00000A00(spu_context*);
 static DWORD WINAPI spurs_pm_flow_watchdog(LPVOID p)
 {
     (void)p;
+    if (!guest_world_register_current("spurs-pm-flow-watch")) return 0;
     extern uint32_t g_pm_flow_buf[]; extern volatile unsigned g_pm_flow_n;
     extern void* volatile g_pm_flow_ctx;
     Sleep(5000);
     spu_context* ctx = (spu_context*)g_pm_flow_ctx;
-    if (!ctx) { fprintf(stderr, "[pm-flow] watchdog: run returned (no hang)\n"); return 0; }
+    if (!ctx) { fprintf(stderr, "[pm-flow] watchdog: run returned (no hang)\n"); guest_world_unregister_current(); return 0; }
     unsigned n = g_pm_flow_n; if (n > 8192) n = 8192;
     fprintf(stderr, "[pm-flow] HUNG-RUN PARTIAL: %u transfers, live pc=0x%05X "
             "LS12A0=%02X%02X LS12C0=%02X%02X LS12F0=%02X%02X%02X%02X LS1300=%02X%02X:",
@@ -457,6 +459,7 @@ static DWORD WINAPI spurs_pm_flow_watchdog(LPVOID p)
     }
     if (rep) fprintf(stderr, "*%u", rep + 1);
     fprintf(stderr, "\n"); fflush(stderr);
+    guest_world_unregister_current();
     return 0;
 }
 void spurs_pm_flow_watchdog_start(void)

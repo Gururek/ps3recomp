@@ -129,6 +129,7 @@ extern "C" {
 #define SYS_TIMER_SLEEP                 142
 
 /* Time */
+#define SYS_TIME_GET_TIMEZONE           144
 #define SYS_TIME_GET_CURRENT_TIME       145
 #define SYS_TIME_GET_TIMEBASE_FREQUENCY 147
 
@@ -188,6 +189,7 @@ extern "C" {
 #define SYS_SPU_THREAD_BIND_QUEUE       193
 #define SYS_SPU_THREAD_UNBIND_QUEUE     194
 #define SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS 251
+#define SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT_ALL_THREADS 252
 
 /* PRX (module) management */
 #define SYS_PRX_LOAD_MODULE             480
@@ -216,19 +218,29 @@ extern "C" {
 #define SYS_FS_CLOSEDIR                 807
 #define SYS_FS_STAT                     808
 #define SYS_FS_FSTAT                    809
+#define SYS_FS_LINK                     810
 #define SYS_FS_MKDIR                    811
 #define SYS_FS_RENAME                   812
 #define SYS_FS_RMDIR                    813
 #define SYS_FS_UNLINK                   814
+#define SYS_FS_UTIME                    815
+#define SYS_FS_ACCESS                   816
 #define SYS_FS_LSEEK                    818
-#define SYS_FS_FTRUNCATE                820
-#define SYS_FS_FGET_BLOCK_SIZE          840
-#define SYS_FS_GET_BLOCK_SIZE           841
+#define SYS_FS_FDATASYNC                819
+#define SYS_FS_FSYNC                    820
+#define SYS_FS_FGET_BLOCK_SIZE          821
+#define SYS_FS_GET_BLOCK_SIZE           822
+#define SYS_FS_TRUNCATE                 831
+#define SYS_FS_FTRUNCATE                832
+#define SYS_FS_SYMLINK                  833
+#define SYS_FS_CHMOD                    834
 
 /* Misc */
 #define SYS_TTY_READ                    402
 #define SYS_TTY_WRITE                   403
 #define SYS_DBG_GET_THREAD_LIST         610
+#define SYS_GPIO_SET                    630
+#define SYS_GPIO_GET                    631
 
 /* Upper limit for the dispatch table */
 #define LV2_SYSCALL_MAX                 1024

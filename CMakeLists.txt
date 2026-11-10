@@ -117,7 +117,37 @@ endif()
 # ---------------------------------------------------------------------------
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
+    if(WIN32)
+        add_executable(test_d3d12_depth_sample
+            libs/video/tests/test_d3d12_depth_sample.c
+            libs/video/rsx_d3d12_depth_sample.c)
+        target_link_libraries(test_d3d12_depth_sample PRIVATE d3d12 d3dcompiler)
+        add_test(NAME d3d12_depth_sample COMMAND test_d3d12_depth_sample)
+        set_tests_properties(d3d12_depth_sample PROPERTIES TIMEOUT 30)
+    endif()
+    add_executable(test_fp_decompiler
+        libs/video/tests/test_fp_decompiler.c
+        libs/video/rsx_fp_decompiler.c
+        libs/video/rsx_vp_decompiler.c
+    )
+    target_include_directories(test_fp_decompiler PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+    )
+    add_test(NAME fp_decompiler COMMAND test_fp_decompiler)
+    add_executable(spu_interp_selftest
+        runtime/spu/tests/spu_interp_selftest.c
+        runtime/spu/spu_interp.c
+    )
+    target_include_directories(spu_interp_selftest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+    )
+    if(UNIX)
+        target_link_libraries(spu_interp_selftest PRIVATE m)
+    endif()
+    add_test(NAME spu_interp_selftest COMMAND spu_interp_selftest)
     add_subdirectory(tests/sync_stress)
+    add_subdirectory(tests/spurs_event_flag)
 endif()
 
 # ---------------------------------------------------------------------------

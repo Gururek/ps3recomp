@@ -43,6 +43,12 @@ extern "C" {
 #define CELL_SPURS_TASK_ERROR_FAULT             (CELL_ERROR_BASE_SPURS | 0x32)
 #define CELL_SPURS_TASK_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x29)
 
+#define CELL_SPURS_JOB_ERROR_INVAL              0x80410A02u
+#define CELL_SPURS_JOB_ERROR_NOMEM              0x80410A04u
+#define CELL_SPURS_JOB_ERROR_STAT               0x80410A0Fu
+#define CELL_SPURS_JOB_ERROR_ALIGN              0x80410A10u
+#define CELL_SPURS_JOB_ERROR_NULL_POINTER       0x80410A11u
+
 /* ---------------------------------------------------------------------------
  * Constants
  * -----------------------------------------------------------------------*/
@@ -85,6 +91,7 @@ typedef struct CellSpursTaskset CellSpursTaskset;
 typedef struct CellSpursTasksetAttribute CellSpursTasksetAttribute;
 typedef struct CellSpursTask CellSpursTask;
 typedef struct CellSpursTaskAttribute CellSpursTaskAttribute;
+typedef struct CellSpursBarrier CellSpursBarrier;
 typedef struct CellSpursEventFlag CellSpursEventFlag;
 typedef struct CellSpursWorkloadAttribute CellSpursWorkloadAttribute;
 
@@ -93,13 +100,22 @@ typedef u32 CellSpursTaskId;
 
 /* SPURS attribute -- used to configure a SPURS instance before creation */
 struct CellSpursAttribute {
-    u32  nSpus;
-    s32  spuPriority[CELL_SPURS_MAX_SPU];
-    u8   prefix[16];
-    u32  prefixSize;
-    u32  flags;
-    u32  container;
-    u8   _padding[128];
+    u32 revision;                 /* 0x00 */
+    u32 sdkVersion;               /* 0x04 */
+    u32 nSpus;                    /* 0x08 */
+    s32 spuPriority;              /* 0x0C */
+    s32 ppuPriority;              /* 0x10 */
+    u8  exitIfNoWork;             /* 0x14 */
+    u8  prefix[15];               /* 0x15, not NUL terminated */
+    u32 prefixSize;               /* 0x24 */
+    u32 flags;                    /* 0x28 */
+    u32 container;                /* 0x2C */
+    u32 unk0;                     /* 0x30 */
+    u32 unk1;                     /* 0x34 */
+    u8  swlPriority[8];           /* 0x38 */
+    u32 swlMaxSpu;                /* 0x40 */
+    u32 swlIsPreemptible;         /* 0x44 */
+    u8  padding[440];             /* 0x48 */
 };
 
 /* Main SPURS instance */
@@ -123,11 +139,18 @@ struct CellSpursTaskset {
 };
 
 struct CellSpursTasksetAttribute {
-    u32  revision;
-    u32  flags;
-    u64  args;
-    u8   priority[CELL_SPURS_MAX_SPU];
-    u8   _padding[64];
+    /* Exact 0x200-byte guest ABI layout.  Multi-byte fields live big-endian in
+     * guest memory and must be accessed through vm_read/vm_write, never by
+     * dereferencing this host struct. */
+    u32  revision;                         /* 0x00 */
+    u32  sdkVersion;                       /* 0x04 */
+    u64  args;                             /* 0x08 */
+    u8   priority[CELL_SPURS_MAX_SPU];     /* 0x10 */
+    u32  maxContention;                    /* 0x18 */
+    u32  name_ea;                          /* 0x1C */
+    u32  tasksetSize;                      /* 0x20 */
+    s32  enableClearLs;                    /* 0x24 */
+    u8   reserved[472];                    /* 0x28 */
 };
 
 /* Task -- represents a unit of SPU work */
@@ -142,19 +165,9 @@ struct CellSpursTask {
 };
 
 struct CellSpursTaskAttribute {
-    u32  revision;
-    u32  sizeContext;
-    u64  eaContext;
-    u64  eaElf;        /* SPU task ELF guest EA (set by _cellSpursTaskAttributeInitialize) */
-    /* Guest EAs of the 16-byte CellSpursTaskLsPattern / CellSpursTaskArgument
-     * blocks passed to _cellSpursTaskAttributeInitialize. A wait-capable task
-     * NEEDS both carried into its TaskInfo: the SPU task library validates
-     * argument != 0 and lsPattern-covers-stack before any blocking wait
-     * (else 0x8041090F) -- dropping them kept LBP's binkspu movie-IO task
-     * spinning forever. */
-    u32  lsPattern_ea;
-    u32  argument_ea;
-    u8   _padding[48];
+    /* Public SDK object is opaque, 0x100 bytes, 16-byte aligned.  cellSpurs.c
+     * keeps its HLE metadata in guest-endian words inside this storage. */
+    u8 reserved[256];
 };
 
 /* Event flag -- SPURS-level event synchronization */
@@ -239,6 +252,22 @@ s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
 s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId);
 
 s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr);
+
+/* Full 14-argument SDK form. Arguments 9-14 live in the PPU parameter-save
+ * area and are supplied by a context-aware HLE wrapper. */
+s32 cellSpursJobChainAttributeInitializeFull(
+    u32 jmRevision, u32 sdkRevision, u64 attr_ea, u64 entry_ea,
+    u32 sizeJobDescriptor, u32 maxGrabbedJob, u64 priority_ea,
+    u32 maxContention, u32 autoRequestSpuCount, u32 tag1, u32 tag2,
+    u32 isFixedMemAlloc, u32 maxSizeJobDescriptor,
+    u32 initialRequestSpuCount);
+
+/* ---------------------------------------------------------------------------
+ * Barrier functions
+ * -----------------------------------------------------------------------*/
+
+s32 cellSpursBarrierInitialize(CellSpursTaskset* taskset,
+                               CellSpursBarrier* barrier, u32 total);
 
 /* ---------------------------------------------------------------------------
  * Workload functions

@@ -34,10 +34,22 @@ u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes);
  * Emits `VSOutput main(VSInput input)`: 16 float4 inputs (ATTR0..15), a
  * `cbuffer VPConst : register(b0)` with 512 vec4 constants + vp_posscale/
  * vp_posoffset (the RSX viewport transform mapped to D3D clip space; the
- * caller computes them per draw), SV_Position + COLOR0/1 + FOG + TEXCOORD0..7
- * varyings routed per the NV40 output register map (o0/o1/o2/o5/o7..o14).
- * Not modeled: condition-code tests, flow control (BRA/CAL/...), TXL. */
+ * caller computes them per draw), SV_Position + COLOR0/1 + FOGC as
+ * `(o5.x,0,0,0)` + TEXCOORD0..9
+ * varyings routed per the NV40 output register map (o0/o1/o2/o5/o7..o15,
+ * with o6 supplying TEX9 when point size is not used). */
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
+
+/* Entry-aware form used by RSX SET_TRANSFORM_PROGRAM_START. Immediate flow
+ * targets remain absolute instruction indices in the captured program bank. */
+int rsx_vp_decompile_entry(const u8* ucode, u32 max_bytes, u32 entry_instr,
+                           char* out, u32 out_size);
+
+/* Backend form. texture_dimensions packs four 3-bit values (unit 0 in bits
+ * 2:0): 1=1D, 2=2D, 3=3D, 4=cube. TXL samples the selected t16..t19 binding
+ * at LOD zero, matching NV40 vertex-texture semantics. */
+int rsx_vp_decompile_entry_tex(const u8* ucode, u32 max_bytes, u32 entry_instr,
+                               u32 texture_dimensions, char* out, u32 out_size);
 
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);

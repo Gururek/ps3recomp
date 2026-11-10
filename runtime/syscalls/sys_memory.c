@@ -135,6 +135,95 @@ int64_t sys_memory_allocate(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * sys_memory_allocate_from_container (syscall 350 / 0x15E)
+ *
+ * r3 = size
+ * r4 = container ID
+ * r5 = page-size flags
+ * r6 = pointer to receive allocated address (u32*)
+ * -----------------------------------------------------------------------*/
+int64_t sys_memory_allocate_from_container(ppu_context* ctx)
+{
+    uint64_t size64       = LV2_ARG_U64(ctx, 0);
+    uint32_t container_id = LV2_ARG_U32(ctx, 1);
+    uint64_t flags        = LV2_ARG_U64(ctx, 2);
+    uint32_t addr_out     = LV2_ARG_PTR(ctx, 3);
+
+    uint32_t alignment =
+        flags == SYS_MEMORY_PAGE_SIZE_1M  ? 0x100000u :
+        flags == SYS_MEMORY_PAGE_SIZE_64K ? 0x10000u  :
+        flags == 0                        ? 0x100000u : 0;
+
+    if (size64 == 0 || size64 > UINT32_MAX ||
+        (alignment != 0 && (size64 & (alignment - 1)) != 0))
+        return (int64_t)(int32_t)CELL_EALIGN;
+    if (alignment == 0)
+        return (int64_t)(int32_t)CELL_EINVAL;
+    if (addr_out == 0)
+        return (int64_t)(int32_t)CELL_EFAULT;
+    if (container_id == 0 || container_id > SYS_MEMORY_CONTAINER_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    uint32_t size = (uint32_t)size64;
+    sys_mem_container_info* c = &g_sys_mem_containers[container_id - 1];
+
+    bump_lock();
+    if (!c->active) {
+        bump_unlock();
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    if (size > c->total_size - c->used_size) {
+        bump_unlock();
+        return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+
+    if (g_sys_mem_bump_ptr == 0)
+        g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
+    g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
+    if (g_sys_mem_bump_ptr > SYS_MEM_ALLOC_END - size) {
+        bump_unlock();
+        return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+
+    int slot = -1;
+    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
+        if (!g_sys_mem_allocs[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        bump_unlock();
+        return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+
+    uint32_t alloc_addr = g_sys_mem_bump_ptr;
+    g_sys_mem_bump_ptr += size;
+    s_total_allocated += size;
+    c->used_size += size;
+
+    sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
+    a->active       = 1;
+    a->addr         = alloc_addr;
+    a->size         = size;
+    a->container_id = (int32_t)container_id;
+    a->page_size    = alignment;
+    bump_unlock();
+
+    if (vm_commit(alloc_addr, size) != CELL_OK) {
+        bump_lock();
+        a->active = 0;
+        s_total_allocated -= size;
+        c->used_size -= size;
+        bump_unlock();
+        return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+
+    write_be32(addr_out, alloc_addr);
+    fprintf(stderr,
+            "[sys_memory] allocate_from_container(cid=%u, size=0x%X) -> 0x%08X\n",
+            container_id, size, alloc_addr);
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * sys_memory_free
  *
  * r3 = address
@@ -145,7 +234,13 @@ int64_t sys_memory_free(ppu_context* ctx)
 
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
+            int32_t container_id = g_sys_mem_allocs[i].container_id;
             s_total_allocated -= g_sys_mem_allocs[i].size;
+            if (container_id > 0 && container_id <= SYS_MEMORY_CONTAINER_MAX) {
+                sys_mem_container_info* c = &g_sys_mem_containers[container_id - 1];
+                if (c->active && c->used_size >= g_sys_mem_allocs[i].size)
+                    c->used_size -= g_sys_mem_allocs[i].size;
+            }
             g_sys_mem_allocs[i].active = 0;
             return CELL_OK;
         }
@@ -432,6 +527,8 @@ void sys_memory_init(lv2_syscall_table* tbl)
 
     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);
     lv2_syscall_register(tbl, SYS_MEMORY_FREE,                 sys_memory_free);
+    lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE_FROM_CONTAINER,
+                         sys_memory_allocate_from_container);
     lv2_syscall_register(tbl, SYS_MEMORY_GET_USER_MEMORY_SIZE, sys_memory_get_user_memory_size);
     lv2_syscall_register(tbl, SYS_MEMORY_GET_PAGE_ATTRIBUTE,   sys_memory_get_page_attribute);
     lv2_syscall_register(tbl, SYS_MEMORY_CONTAINER_CREATE,     sys_memory_container_create);

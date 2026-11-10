@@ -20,10 +20,12 @@ extern "C" {
  * -----------------------------------------------------------------------*/
 #define CELL_RESC_ERROR_NOT_INITIALIZED    0x80210301
 #define CELL_RESC_ERROR_REINITIALIZED      0x80210302
-#define CELL_RESC_ERROR_BAD_ARGUMENT       0x80210303
-#define CELL_RESC_ERROR_BAD_COMBINATION    0x80210304
-#define CELL_RESC_ERROR_BAD_ALIGNMENT      0x80210305
-#define CELL_RESC_ERROR_INSUFFICIENT_BUFFER 0x80210306
+#define CELL_RESC_ERROR_BAD_ALIGNMENT      0x80210303
+#define CELL_RESC_ERROR_BAD_ARGUMENT       0x80210304
+#define CELL_RESC_ERROR_LESS_MEMORY        0x80210305
+#define CELL_RESC_ERROR_GCM_FLIP_QUE_FULL  0x80210306
+#define CELL_RESC_ERROR_BAD_COMBINATION    0x80210307
+#define CELL_RESC_ERROR_UNKNOWN_308        0x80210308
 
 /* ---------------------------------------------------------------------------
  * Display buffer modes
@@ -48,13 +50,20 @@ extern "C" {
 #define CELL_RESC_PAL_60_INTERPOLATE       2
 #define CELL_RESC_PAL_60_INTERPOLATE_30_DROP   3
 #define CELL_RESC_PAL_60_INTERPOLATE_DROP_FLEXIBLE 4
+#define CELL_RESC_PAL_60_FOR_HSYNC         5
+
+/* Flip mode */
+#define CELL_RESC_DISPLAY_VSYNC            0
+#define CELL_RESC_DISPLAY_HSYNC            1
 
 /* ---------------------------------------------------------------------------
  * Ratio conversion mode
  * -----------------------------------------------------------------------*/
-#define CELL_RESC_INTERLACE_FILTER         0
-#define CELL_RESC_NORMAL_BILINEAR          1
-#define CELL_RESC_ELEMENT_BILINEAR         2
+#define CELL_RESC_NORMAL_BILINEAR          0
+#define CELL_RESC_INTERLACE_FILTER         1
+#define CELL_RESC_3X3_GAUSSIAN             2
+#define CELL_RESC_2X3_QUINCUNX             3
+#define CELL_RESC_2X3_QUINCUNX_ALT         4
 
 /* ---------------------------------------------------------------------------
  * Types
@@ -73,8 +82,8 @@ typedef struct CellRescInitConfig {
 typedef struct CellRescSrc {
     u32 format;
     u32 pitch;
-    u32 width;
-    u32 height;
+    u16 width;
+    u16 height;
     u32 offset;
 } CellRescSrc;
 
@@ -92,20 +101,21 @@ s32 cellRescInit(const CellRescInitConfig* initConfig);
 void cellRescExit(void);
 
 s32 cellRescSetDisplayMode(u32 displayMode);
-s32 cellRescGetNumColorBuffers(u32 displayMode, u32 palTemporalMode, u32* numBufs);
+s32 cellRescGetNumColorBuffers(u32 displayMode, u32 palTemporalMode, s32 reserved);
 
 s32 cellRescGetBufferSize(u32* colorBufSize, u32* vertexBufSize, u32* fragmentBufSize);
 s32 cellRescSetBufferAddress(void* colorBuf, void* vertexBuf, void* fragmentBuf);
 
 s32 cellRescSetSrc(s32 index, const CellRescSrc* src);
 s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts);
-s32 cellRescSetConvertAndFlip(s32 index);
+s32 cellRescSetConvertAndFlip(void* context, s32 index);
+s32 cellRescSetWaitFlip(void* context);
 
-s32 cellRescSetFlipHandler(void (*handler)(u32));
-s32 cellRescSetVBlankHandler(void (*handler)(u32));
+void cellRescSetFlipHandler(void (*handler)(u32));
+void cellRescSetVBlankHandler(void (*handler)(u32));
 
 s32 cellRescGetDisplayMode(u32* displayMode);
-s32 cellRescGetLastFlipTime(u64* time);
+u64 cellRescGetLastFlipTime(void);
 void cellRescResetFlipStatus(void);
 s32 cellRescGetFlipStatus(void);
 

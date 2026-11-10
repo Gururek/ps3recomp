@@ -102,7 +102,7 @@ static inline double vm_read_f64(uint32_t addr)
 extern "C" {
 #endif
 extern int  g_resv_store_active;
-void        ppu_resv_break_store(uint64_t ea);
+void        ppu_resv_break_store(uint64_t ea, uint32_t width);
 #ifdef __cplusplus
 }
 #endif
@@ -110,26 +110,28 @@ void        ppu_resv_break_store(uint64_t ea);
 static inline void vm_write8(uint32_t addr, uint8_t val)
 {
     *vm_ptr8(addr) = val;
+    if (g_resv_store_active > 0) ppu_resv_break_store(addr, 1);
 }
 
 static inline void vm_write16(uint32_t addr, uint16_t val)
 {
     uint16_t raw = ps3_bswap16(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    if (g_resv_store_active > 0) ppu_resv_break_store(addr, 2);
 }
 
 static inline void vm_write32(uint32_t addr, uint32_t val)
 {
     uint32_t raw = ps3_bswap32(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
-    if (g_resv_store_active > 0) ppu_resv_break_store(addr);
+    if (g_resv_store_active > 0) ppu_resv_break_store(addr, 4);
 }
 
 static inline void vm_write64(uint32_t addr, uint64_t val)
 {
     uint64_t raw = ps3_bswap64(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
-    if (g_resv_store_active > 0) ppu_resv_break_store(addr);
+    if (g_resv_store_active > 0) ppu_resv_break_store(addr, 8);
 }
 
 static inline void vm_write_f32(uint32_t addr, float val)

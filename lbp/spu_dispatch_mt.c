@@ -54,6 +54,11 @@ void spu_indirect_branch_mt(spu_context* ctx)
     int special = (ctx->policy_mode &&
                    (pc == SPURS_PM_EXIT_TO_KERNEL_LS ||
                     pc == SPURS_PM_SELECT_WORKLOAD_LS))
+                  /* Direct SPURS jobs return to their manager by branching to
+                   * LS 0. The full resolver terminates the host job there;
+                   * looking up image function 0 would restart the CRT forever
+                   * with dead argument registers. */
+                  || (ctx->image_id != 0 && !ctx->policy_mode && pc == 0)
                   || pc == TASKSET_PM_SYSCALL_ADDR
                   || ctx->image_id == 23;
     if (!special) {

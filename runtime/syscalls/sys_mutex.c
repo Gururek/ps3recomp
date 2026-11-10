@@ -14,6 +14,17 @@
 sys_mutex_info g_sys_mutexes[SYS_MUTEX_MAX];
 
 #ifdef _WIN32
+static __declspec(thread) unsigned s_current_thread_mutex_depth;
+#else
+static _Thread_local unsigned s_current_thread_mutex_depth;
+#endif
+
+unsigned sys_mutex_current_thread_lock_count(void)
+{
+    return s_current_thread_mutex_depth;
+}
+
+#ifdef _WIN32
 static CRITICAL_SECTION s_mtx_table_lock;
 static int              s_mtx_table_lock_init = 0;
 #else
@@ -158,6 +169,13 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
+    /* A live owner must release the mutex before its host primitive and
+     * ownership accounting can be destroyed. LV2 reports BUSY here. */
+    if (m->lock_count > 0) {
+        mtx_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+
 #ifdef _WIN32
     DeleteCriticalSection(&m->cs);
     if (m->wait_handle) CloseHandle(m->wait_handle);
@@ -238,6 +256,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
 
     m->owner_tid = caller_tid;
     m->lock_count++;
+    ++s_current_thread_mutex_depth;
     return CELL_OK;
 }
 
@@ -278,6 +297,7 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
          * by this fix. */
 #endif
         m->lock_count++;
+        ++s_current_thread_mutex_depth;
         return CELL_OK;
     }
 
@@ -294,6 +314,7 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
 
     m->owner_tid = caller_tid;
     m->lock_count++;
+    ++s_current_thread_mutex_depth;
     return CELL_OK;
 }
 
@@ -325,6 +346,7 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
     }
 
     m->lock_count--;
+    if (s_current_thread_mutex_depth) --s_current_thread_mutex_depth;
     if (m->lock_count == 0) {
         m->owner_tid = 0;
     }
@@ -344,6 +366,7 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
 void sys_mutex_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_mutexes, 0, sizeof(g_sys_mutexes));
+    s_current_thread_mutex_depth = 0;
 
 #ifdef _WIN32
     if (!s_mtx_table_lock_init) {

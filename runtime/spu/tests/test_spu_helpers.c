@@ -14,6 +14,7 @@
  */
 
 #include "../spu_helpers.h"
+#include "../spu_workload.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -234,11 +235,17 @@ static void test_shufb(void) {
     u128 a = from_bytes(a_bytes);
     u128 b = from_bytes(b_bytes);
 
-    TEST("shufb identity (selectors 0x00..0x0F pick a in order)");
+    TEST("shufb selectors 0x00..0x0F pick a in order");
     EXPECT_EQ(spu_shufb(a, b, from_bytes(a_bytes)), a);
 
     TEST("shufb selectors 0x10..0x1F pick b in order");
     EXPECT_EQ(spu_shufb(a, b, from_bytes(b_bytes)), b);
+
+    TEST("shufb selector banks map 0..15 to a and 16..31 to b");
+    EXPECT_EQ(spu_shufb(spu_splat_u8(0x11), spu_splat_u8(0x22), spu_splat_u8(0x00)),
+              spu_splat_u8(0x11));
+    EXPECT_EQ(spu_shufb(spu_splat_u8(0x11), spu_splat_u8(0x22), spu_splat_u8(0x10)),
+              spu_splat_u8(0x22));
 
     TEST("shufb special: sel & 0xE0 == 0xE0 -> 0x80");
     EXPECT_EQ(spu_shufb(a, b, spu_splat_u8(0xE0)), spu_splat_u8(0x80));
@@ -259,6 +266,69 @@ static void test_shufb(void) {
                                 0x14,0x15,0x16,0x17,0x18,0x19,0x1A,0x1B,
                                 0x1C,0x1D,0x1E,0x1F};
         EXPECT_EQ(spu_shufb(a, b, from_bytes(sel)), from_bytes(expected));
+    }
+
+    TEST("Tokyo SMC cntb plus ila(0x00010203) shufb packs byte counts per word");
+    {
+        uint8_t bits[16] = {0xFF,0x0F,0x03,0x01, 0,0,0,0, 0,0,0,0, 0,0,0,0};
+        uint8_t expected[16] = {8,4,2,1, 8,4,2,1, 8,4,2,1, 8,4,2,1};
+        u128 counts = spu_cntb(from_bytes(bits));
+        EXPECT_EQ(spu_shufb(counts, counts, spu_ila(0x00010203)), from_bytes(expected));
+    }
+
+    TEST("cntb returns exact per-byte counts for mixed, zero, and full bytes");
+    {
+        uint8_t bits[16] = {
+            0x00,0x01,0x02,0x03, 0x07,0x0F,0x1F,0x3F,
+            0x7F,0xFF,0x55,0xAA, 0x81,0x42,0x24,0x18
+        };
+        uint8_t expected[16] = {
+            0,1,1,2, 3,4,5,6, 7,8,4,4, 2,2,2,2
+        };
+        EXPECT_EQ(spu_cntb(from_bytes(bits)), from_bytes(expected));
+    }
+
+    TEST("cntb is exact for all 256 byte values");
+    for (unsigned value = 0; value <= 0xFFu; ++value) {
+        uint8_t bits[16];
+        uint8_t expected[16];
+        unsigned count = 0;
+        for (unsigned scan = value; scan; scan >>= 1) count += scan & 1u;
+        for (int lane = 0; lane < 16; ++lane) {
+            bits[lane] = (uint8_t)value;
+            expected[lane] = (uint8_t)count;
+        }
+        EXPECT_EQ(spu_cntb(from_bytes(bits)), from_bytes(expected));
+    }
+
+    TEST("shufb all 256 selectors are exact in every output lane");
+    {
+        int ok = 1;
+        for (int lane = 0; lane < 16 && ok; ++lane) {
+            for (int selector = 0; selector < 256; ++selector) {
+                uint8_t control[16], expected[16];
+                for (int i = 0; i < 16; ++i) control[i] = (uint8_t)(i * 17);
+                control[lane] = (uint8_t)selector;
+                for (int i = 0; i < 16; ++i) {
+                    uint8_t s = control[i];
+                    if ((s & 0xE0) == 0xE0) expected[i] = 0x80;
+                    else if ((s & 0xC0) == 0xC0) expected[i] = 0xFF;
+                    else if ((s & 0xC0) == 0x80) expected[i] = 0x00;
+                    else expected[i] = (s & 0x10)
+                        ? b_bytes[s & 0x0F] : a_bytes[s & 0x0F];
+                }
+                u128 actual = spu_shufb(a, b, from_bytes(control));
+                if (!u128_eq(actual, from_bytes(expected))) {
+                    fprintf(stderr, "FAIL: %s lane=%d selector=0x%02X\n",
+                            g_current, lane, selector);
+                    print_u128("actual", actual);
+                    print_u128("expected", from_bytes(expected));
+                    ok = 0;
+                    break;
+                }
+            }
+        }
+        if (ok) g_pass++; else g_fail++;
     }
 }
 
@@ -310,23 +380,50 @@ static void test_constant_generators(void) {
     TEST("cwd_pos byte 5 aligns down to slot 1 (offset 4)");
     EXPECT_EQ(spu_cwd_pos(5), spu_cwd_pos(4));
 
-    TEST("cbd_pos at byte 7 inserts single byte 0x03 at offset 7");
+    TEST("cbd_pos at byte 7 inserts selector 0x03 at offset 7");
     {
         uint8_t exp[16]; memcpy(exp, identity_b, 16);
         exp[7]=0x03;
         EXPECT_EQ(spu_cbd_pos(7), from_bytes(exp));
     }
-    TEST("chd_pos at byte 6 inserts halfword [02,03] at offset 6 (aligned)");
+    TEST("chd_pos at byte 6 inserts selectors [02,03] at offset 6 (aligned)");
     {
         uint8_t exp[16]; memcpy(exp, identity_b, 16);
         exp[6]=0x02; exp[7]=0x03;
         EXPECT_EQ(spu_chd_pos(6), from_bytes(exp));
     }
-    TEST("cdd_pos at byte 0 inserts dword [00..07] at slot 0");
+    TEST("cdd_pos at byte 0 inserts dword selectors [00..07] at slot 0");
     {
         uint8_t exp[16]; memcpy(exp, identity_b, 16);
         for (int j = 0; j < 8; j++) exp[j] = (uint8_t)j;
         EXPECT_EQ(spu_cdd_pos(0), from_bytes(exp));
+    }
+
+    uint8_t a_bytes[16] = {0xA0,0xA1,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7,
+                           0xA8,0xA9,0xAA,0xAB,0xAC,0xAD,0xAE,0xAF};
+    uint8_t b_bytes[16] = {0xB0,0xB1,0xB2,0xB3,0xB4,0xB5,0xB6,0xB7,
+                           0xB8,0xB9,0xBA,0xBB,0xBC,0xBD,0xBE,0xBF};
+    u128 a = from_bytes(a_bytes), b = from_bytes(b_bytes);
+
+    TEST("cbd control inserts a preferred byte into b");
+    {
+        uint8_t exp[16]; memcpy(exp, b_bytes, 16); exp[7] = a_bytes[3];
+        EXPECT_EQ(spu_shufb(a, b, spu_cbd_pos(7)), from_bytes(exp));
+    }
+    TEST("chd control inserts a preferred halfword into b");
+    {
+        uint8_t exp[16]; memcpy(exp, b_bytes, 16); exp[6] = a_bytes[2]; exp[7] = a_bytes[3];
+        EXPECT_EQ(spu_shufb(a, b, spu_chd_pos(6)), from_bytes(exp));
+    }
+    TEST("cwd control inserts a preferred word into b");
+    {
+        uint8_t exp[16]; memcpy(exp, b_bytes, 16); for (int j = 0; j < 4; j++) exp[4+j] = a_bytes[j];
+        EXPECT_EQ(spu_shufb(a, b, spu_cwd_pos(4)), from_bytes(exp));
+    }
+    TEST("cdd control inserts a preferred doubleword into b");
+    {
+        uint8_t exp[16]; memcpy(exp, b_bytes, 16); for (int j = 0; j < 8; j++) exp[8+j] = a_bytes[j];
+        EXPECT_EQ(spu_shufb(a, b, spu_cdd_pos(8)), from_bytes(exp));
     }
 }
 
@@ -350,6 +447,40 @@ static void test_fsmbi(void) {
         uint8_t exp[16] = {0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0xFF};
         EXPECT_EQ(spu_fsmbi(0x0001), from_bytes(exp));
     }
+
+    TEST("fsmb dynamic path matches exact immediate masks");
+    {
+        u128 input = spu_zero();
+        input._u32[0] = 0xA5C3u;
+        EXPECT_EQ(spu_fsmb(input), spu_fsmbi(0xA5C3));
+        input._u32[0] = 0;
+        EXPECT_EQ(spu_fsmb(input), spu_zero());
+        input._u32[0] = 0xFFFFu;
+        EXPECT_EQ(spu_fsmb(input), spu_splat_u8(0xFF));
+    }
+
+
+    TEST("fsmb dynamic path matches all 65536 exact masks");
+    for (unsigned mask = 0; mask <= 0xFFFFu; ++mask) {
+        u128 input = spu_zero();
+        input._u32[0] = mask;
+        EXPECT_EQ(spu_fsmb(input), spu_fsmbi((int32_t)mask));
+    }
+}
+
+/* ===========================================================================
+ * Gather halfword low bits
+ * ===========================================================================*/
+static void test_gbh(void) {
+    TEST("gbh gathers all 256 halfword-bit combinations in SPU order");
+    for (unsigned mask = 0; mask <= 0xFFu; ++mask) {
+        u128 input = spu_splat_u16(0xA500u);
+        for (int halfword = 0; halfword < 8; ++halfword) {
+            input._u16[halfword ^ 1] |=
+                (uint16_t)((mask >> (7 - halfword)) & 1u);
+        }
+        EXPECT_EQ(spu_gbh(input), spu_pref_u32(mask));
+    }
 }
 
 /* ===========================================================================
@@ -367,10 +498,43 @@ static void test_sign_extend(void) {
     TEST("xshw: sign-extend low halfword of each word");
     EXPECT_EQ(spu_xshw(spu_il(0x0000FFFE)), spu_il((int32_t)0xFFFFFFFE));
 
-    TEST("xswd: sign-extend low word of each dword to 64-bit");
-    u128 in_xswd = make128(0x00000000FFFFFFFFULL, 0x000000007FFFFFFFULL);
-    u128 expected_xswd = make128(0xFFFFFFFFFFFFFFFFULL, 0x000000007FFFFFFFULL);
-    EXPECT_EQ(spu_xswd(in_xswd), expected_xswd);
+    /* Words are in SPU order here, unlike native _u64: the low words of
+     * architectural doublewords are word 1 and word 3. Distinct high words
+     * catch accidental use of RPCS3's reversed host-word numbering. */
+    TEST("xswd: architectural low words, distinct signs and poisoned high words");
+    const uint8_t xswd_input[16] = {
+        0x12,0x34,0x56,0x78, 0xFF,0xFF,0xFF,0xFE,
+        0x87,0x65,0x43,0x21, 0x7F,0xFF,0xFF,0xFF};
+    const uint8_t xswd_expected[16] = {
+        0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFE,
+        0x00,0x00,0x00,0x00, 0x7F,0xFF,0xFF,0xFF};
+    EXPECT_EQ(spu_xswd(from_bytes(xswd_input)), from_bytes(xswd_expected));
+
+    TEST("xswd: zero and minimum signed word preserve architectural byte order");
+    const uint8_t xswd_edges[16] = {
+        0xFF,0xFF,0xFF,0xFF, 0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00, 0x80,0x00,0x00,0x00};
+    const uint8_t xswd_edges_expected[16] = {
+        0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+        0xFF,0xFF,0xFF,0xFF, 0x80,0x00,0x00,0x00};
+    EXPECT_EQ(spu_xswd(from_bytes(xswd_edges)), from_bytes(xswd_edges_expected));
+
+    TEST("SGX mixer: original sample-counter sequence advances 128 samples");
+    /* socjob2 LS 0x6C8..0x6E8: ROTQMBYI, XSWD, CG, SHUFB, ADDX,
+     * SHUFB. The former helper read word 0 (zero after the byte shift),
+     * leaving the movie stream's consumption counter permanently zero. */
+    const uint8_t sgx_carry_control[16] = {
+        4,5,6,7, 0x80,0x80,0x80,0x80,
+        12,13,14,15, 0x80,0x80,0x80,0x80};
+    const uint8_t sgx_counter_expected[16] = {
+        0,0,0,0, 0,0,0,128, 0,0,0,0, 0,0,0,0};
+    u128 sgx_count = spu_zero();
+    u128 sgx_delta = spu_xswd(spu_rotqmbyi(spu_link(128), -4));
+    u128 sgx_carry = spu_cg(sgx_count, sgx_delta);
+    sgx_carry = spu_shufb(sgx_carry, sgx_carry, from_bytes(sgx_carry_control));
+    u128 sgx_sum = spu_addx(sgx_count, sgx_delta, sgx_carry);
+    sgx_count = spu_shufb(sgx_sum, sgx_count, spu_cdd(spu_zero(), 0));
+    EXPECT_EQ(sgx_count, from_bytes(sgx_counter_expected));
 }
 
 /* ===========================================================================
@@ -379,9 +543,78 @@ static void test_sign_extend(void) {
 static void float_splat(u128* r, float v) {
     for (int i = 0; i < 4; i++) r->_f32[i] = v;
 }
+static u128 f32x4(float a, float b, float c, float d) {
+    u128 r; r._f32[0]=a; r._f32[1]=b; r._f32[2]=c; r._f32[3]=d; return r;
+}
+static u128 s32x4(int32_t a, int32_t b, int32_t c, int32_t d) {
+    u128 r; r._s32[0]=a; r._s32[1]=b; r._s32[2]=c; r._s32[3]=d; return r;
+}
+static u128 u32x4(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    u128 r; r._u32[0]=a; r._u32[1]=b; r._u32[2]=c; r._u32[3]=d; return r;
+}
 static int u128_f32_eq_all(u128 a, float v) {
     for (int i = 0; i < 4; i++) if (a._f32[i] != v) return 0;
     return 1;
+}
+static void test_float_int_conversions(void) {
+    TEST("cflts neutral i8=173 truncates toward zero");
+    EXPECT_EQ(spu_cflts(f32x4(1.75f, -1.75f, 0.0f, 42.0f), 173),
+              s32x4(1, -1, 0, 42));
+
+    TEST("cflts i8=172 scales by 2 and saturates signed output");
+    EXPECT_EQ(spu_cflts(f32x4(1.875f, -1.875f, 1073741824.0f, -1073741824.0f), 172),
+              s32x4(3, -3, INT32_MAX, INT32_MIN));
+
+    TEST("cflts i8=0 float-scale overflow saturates smallest positive subnormal");
+    EXPECT_EQ(spu_cflts(u32x4(1, 1, 1, 1), 0),
+              s32x4(INT32_MAX, INT32_MAX, INT32_MAX, INT32_MAX));
+
+    TEST("cflts maps NaN and negative infinity to minimum, positive infinity to maximum");
+    EXPECT_EQ(spu_cflts(u32x4(0x7fc00000u, 0x7f800000u, 0xff800000u, 0), 173),
+              s32x4(INT32_MIN, INT32_MAX, INT32_MIN, 0));
+
+    TEST("cflts preserves the last in-range integer and saturates both exact bounds");
+    EXPECT_EQ(spu_cflts(f32x4(2147483520.0f, 2147483648.0f,
+                              -2147483648.0f, -2147483904.0f), 173),
+              s32x4(2147483520, INT32_MAX, INT32_MIN, INT32_MIN));
+
+    TEST("cfltu neutral i8=173 truncates and clamps negatives");
+    EXPECT_EQ(spu_cfltu(f32x4(-1.5f, 1.75f, 42.0f, 0.0f), 173),
+              u32x4(0, 1, 42, 0));
+
+    TEST("cfltu i8=172 scales by 2 and saturates unsigned output");
+    EXPECT_EQ(spu_cfltu(f32x4(-1.5f, 1.875f, 2147483648.0f, 1.0f), 172),
+              u32x4(0, 3, UINT32_MAX, 2));
+
+    TEST("cfltu i8=0 float-scale overflow saturates smallest positive subnormal");
+    EXPECT_EQ(spu_cfltu(u32x4(1, 1, 1, 1), 0),
+              u32x4(UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX));
+
+    TEST("cfltu maps NaN and negative infinity to zero, positive infinity to maximum");
+    EXPECT_EQ(spu_cfltu(u32x4(0x7fc00000u, 0x7f800000u, 0xff800000u, 0), 173),
+              u32x4(0, UINT32_MAX, 0, 0));
+
+    TEST("csflt neutral i8=155 preserves signed integer magnitude");
+    EXPECT_EQ(spu_csflt(s32x4(1, -2, 0, 123456), 155),
+              f32x4(1.0f, -2.0f, 0.0f, 123456.0f));
+
+    TEST("csflt i8=156 scales signed output by 2");
+    EXPECT_EQ(spu_csflt(s32x4(1, -2, 1073741824, -1073741824), 156),
+              f32x4(2.0f, -4.0f, 2147483648.0f, -2147483648.0f));
+
+    TEST("csflt i8=0 float scale underflows to zero");
+    EXPECT_EQ(spu_csflt(s32x4(1, 2, 3, 4), 0), f32x4(0.0f, 0.0f, 0.0f, 0.0f));
+
+    TEST("cuflt neutral i8=155 preserves unsigned integer magnitude");
+    EXPECT_EQ(spu_cuflt(u32x4(1, 2, 0, 16777216), 155),
+              f32x4(1.0f, 2.0f, 0.0f, 16777216.0f));
+
+    TEST("cuflt i8=156 scales unsigned output by 2");
+    EXPECT_EQ(spu_cuflt(u32x4(1, 2, 1073741824, 0), 156),
+              f32x4(2.0f, 4.0f, 2147483648.0f, 0.0f));
+
+    TEST("cuflt i8=0 float scale underflows to zero");
+    EXPECT_EQ(spu_cuflt(u32x4(1, 2, 3, 4), 0), f32x4(0.0f, 0.0f, 0.0f, 0.0f));
 }
 static void test_float_fused(void) {
     u128 a, b, c;
@@ -402,6 +635,219 @@ static void test_float_fused(void) {
     else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
 }
 
+/* Extended-finite arithmetic used as a culling mask, plus ordinary lanes. */
+static void test_extended_float_masks(void) {
+    u128 a = {._u32 = {0, 0xffffffffu, 0, 0x40000000u}};
+    u128 b = {._u32 = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0x40400000u}};
+    u128 c = {._u32 = {0, 0, 0xffffffffu, 0x3f800000u}};
+    u128 expected = {._u32 = {0, 0x7fffffffu, 0, 0x40c00000u}};
+    TEST("extended fm: zero, saturation and ordinary lane");
+    EXPECT_EQ(spu_fm(a, b), expected);
+    expected._u32[2] = 0xffffffffu; expected._u32[3] = 0x40e00000u;
+    TEST("extended fma: zero, saturation and ordinary lane");
+    EXPECT_EQ(spu_fma(a, b, c), expected);
+    expected._u32[2] = 0x7fffffffu; expected._u32[3] = 0x40a00000u;
+    TEST("extended fms: subtract extended addend");
+    EXPECT_EQ(spu_fms(a, b, c), expected);
+    expected._u32[1] = 0xffffffffu; expected._u32[2] = 0xffffffffu;
+    expected._u32[3] = 0xc0a00000u;
+    TEST("extended fnms: mixed culling flags preserve zero lane");
+    EXPECT_EQ(spu_fnms(a, b, c), expected);
+    TEST("extended fnms then gb: only intended culling bits survive");
+    expected = spu_zero(); expected._u32[0] = 6;
+    EXPECT_EQ(spu_gb(spu_fnms(a, b, c)), expected);
+    for (unsigned bits = 0; bits < 8; bits++) {
+        a = spu_splat_u32(bits & 1 ? 0xffffffffu : 0);
+        b = spu_splat_u32(bits & 2 ? 0xffffffffu : 0);
+        c = spu_splat_u32(bits & 4 ? 0xffffffffu : 0);
+        expected = spu_splat_u32((bits & 3) == 3 || (bits & 4) ? 0xffffffffu : 0);
+        TEST("extended fnms: all eight Boolean-mask input combinations");
+        EXPECT_EQ(spu_fnms(a, b, c), expected);
+    }
+}
+
+/* ===========================================================================
+ * SPURS task signal: one guest SIGNALLED bit, never a counted token queue
+ * ===========================================================================*/
+static void test_task_signal_pending(void) {
+    uint16_t pending = 0;
+
+    TEST("task signal first delivery sets pending bit");
+    pending = spu_task_signal_merge_pending(pending);
+    if (pending == 1) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s pending=%u\n", g_current, pending); }
+
+    TEST("task signal duplicate delivery coalesces while pending");
+    for (int i = 0; i < 65536; ++i)
+        pending = spu_task_signal_merge_pending(pending);
+    if (pending == 1) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s pending=%u\n", g_current, pending); }
+
+    TEST("WAIT_SIGNAL consumes the pending bit exactly once");
+    pending = spu_task_signal_consume_pending(pending);
+    if (pending == 0) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s pending=%u\n", g_current, pending); }
+
+    TEST("new delivery after consume is independently observable");
+    pending = spu_task_signal_merge_pending(pending);
+    pending = spu_task_signal_consume_pending(pending);
+    if (pending == 0) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s pending=%u\n", g_current, pending); }
+
+    TEST("no observed SPU edge adds no pending delivery");
+    pending = spu_task_signal_merge_observed_edge(0, 0);
+    if (pending == 0) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s pending=%u\n", g_current, pending); }
+
+    TEST("current SPU guest edge becomes one pending delivery");
+    pending = spu_task_signal_merge_observed_edge(0, 1);
+    if (pending == 1) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s pending=%u\n", g_current, pending); }
+
+    TEST("mixed PPU and SPU overlap still coalesces to one bit");
+    pending = spu_task_signal_merge_observed_edge(pending, 1);
+    if (pending == 1) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s pending=%u\n", g_current, pending); }
+
+    TEST("guest signal bit remains authoritative without host shadow");
+    if (spu_task_signal_is_pending(0, 1)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("generation retry requires parked expected worker with unchanged epochs");
+    if (spu_task_signal_generation_retry_candidate(
+            0, 0, 1, 15, 15, 41, 41, 19, 19)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("generation retry rejects pending bridge or guest signal");
+    if (!spu_task_signal_generation_retry_candidate(
+            1, 0, 1, 15, 15, 41, 41, 19, 19) &&
+        !spu_task_signal_generation_retry_candidate(
+            0, 1, 1, 15, 15, 41, 41, 19, 19)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("generation retry rejects wrong worker or changed delivery-consume epoch");
+    if (!spu_task_signal_generation_retry_candidate(
+            0, 0, 0, 15, 15, 41, 41, 19, 19) &&
+        !spu_task_signal_generation_retry_candidate(
+            0, 0, 1, 14, 15, 41, 41, 19, 19) &&
+        !spu_task_signal_generation_retry_candidate(
+            0, 0, 1, 15, 15, 42, 41, 19, 19) &&
+        !spu_task_signal_generation_retry_candidate(
+            0, 0, 1, 15, 15, 41, 41, 20, 19)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("generation retry claim is one-shot for current C904 generation");
+    if (spu_task_signal_generation_can_claim(7, 7, 0) &&
+        !spu_task_signal_generation_can_claim(7, 7, 7) &&
+        !spu_task_signal_generation_can_claim(7, 6, 0) &&
+        !spu_task_signal_generation_can_claim(0, 0, 0)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("new C904 generation rearms one retry claim");
+    if (spu_task_signal_generation_can_claim(8, 8, 7) &&
+        !spu_task_signal_generation_can_claim(8, 8, 8)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("wait-entry recovery waits until every exact waiter is parked");
+    if (!spu_task_signal_generation_retry_batch_ready(
+            7, 7, 0, 1, 0, 1) &&
+        spu_task_signal_generation_retry_batch_ready(
+            7, 7, 0, 1, 1, 1)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("wait-entry recovery claims only the exact generation once");
+    if (!spu_task_signal_generation_retry_batch_ready(
+            8, 7, 0, 1, 1, 1) &&
+        !spu_task_signal_generation_retry_batch_ready(
+            7, 7, 7, 1, 1, 1) &&
+        spu_task_signal_generation_retry_batch_ready(
+            7, 7, 0, 1, 1, 1)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("wait-entry recovery blocks stale epoch, pending, guest, completion");
+    if (!spu_task_signal_generation_retry_candidate(
+            0, 0, 1, 15, 15, 42, 41, 19, 19) &&
+        !spu_task_signal_generation_retry_candidate(
+            1, 0, 1, 15, 15, 41, 41, 19, 19) &&
+        !spu_task_signal_generation_retry_candidate(
+            0, 1, 1, 15, 15, 41, 41, 19, 19) &&
+        !spu_task_signal_generation_retry_batch_ready(
+            7, 7, 0, 1, 1, 0)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("follow-up ignores the arm's primary CA9C debt policy");
+    if (spu_task_signal_generation_retry_policy_matches(1, 0, 1) &&
+        spu_task_signal_generation_retry_policy_matches(1, 1, 0) &&
+        !spu_task_signal_generation_retry_policy_matches(1, 0, 0)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("follow-up retry requires exactly one delivered-consumed first pass");
+    if (spu_task_signal_generation_followup_retry_candidate(
+            0, 0, 1, 15, 15, 11, 10, 21, 20) &&
+        !spu_task_signal_generation_followup_retry_candidate(
+            1, 0, 1, 15, 15, 11, 10, 21, 20) &&
+        !spu_task_signal_generation_followup_retry_candidate(
+            0, 1, 1, 15, 15, 11, 10, 21, 20) &&
+        !spu_task_signal_generation_followup_retry_candidate(
+            0, 0, 1, 14, 15, 11, 10, 21, 20) &&
+        !spu_task_signal_generation_followup_retry_candidate(
+            0, 0, 1, 15, 15, 12, 10, 21, 20) &&
+        !spu_task_signal_generation_followup_retry_candidate(
+            0, 0, 1, 15, 15, 11, 10, 20, 20)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("follow-up epoch state keeps partial primary passes retryable");
+    if (spu_task_signal_generation_followup_epoch_state(10, 10, 20, 20) == 0 &&
+        spu_task_signal_generation_followup_epoch_state(11, 10, 20, 20) == 0 &&
+        spu_task_signal_generation_followup_epoch_state(11, 10, 21, 20) == 1 &&
+        spu_task_signal_generation_followup_epoch_state(12, 10, 21, 20) == -1 &&
+        spu_task_signal_generation_followup_epoch_state(11, 10, 22, 20) == -1)
+        g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("wait-owned follow-up retry claim is one-shot for current generation");
+    if (spu_task_signal_generation_followup_can_claim(7, 7, 0) &&
+        !spu_task_signal_generation_followup_can_claim(7, 7, 7) &&
+        !spu_task_signal_generation_followup_can_claim(8, 7, 0) &&
+        !spu_task_signal_generation_followup_can_claim(0, 0, 0)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("exact CA9C substitution debt survives rollover and consumes FIFO");
+    uint64_t debt = spu_task_signal_add_ca9c_substitution_debt(0);
+    debt = spu_task_signal_add_ca9c_substitution_debt(debt);
+    debt = spu_task_signal_consume_ca9c_substitution_debt(debt);
+    uint64_t after_first_ca9c = debt;
+    debt = spu_task_signal_consume_ca9c_substitution_debt(debt);
+    if (after_first_ca9c == 1 && debt == 0 &&
+        spu_task_signal_consume_ca9c_substitution_debt(0) == 0 &&
+        spu_task_signal_add_ca9c_substitution_debt(UINT64_MAX) == UINT64_MAX)
+        g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("CA9C atomically chooses debt consume or normal delivery");
+    if (spu_task_signal_ca9c_action(1) == SPU_CA9C_ACTION_CONSUME_DEBT &&
+        spu_task_signal_ca9c_action(UINT64_MAX) == SPU_CA9C_ACTION_CONSUME_DEBT &&
+        spu_task_signal_ca9c_action(0) == SPU_CA9C_ACTION_DELIVER_SIGNAL) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("CA9C normal delivery edge blocks synthetic recovery");
+    if (spu_task_signal_ca9c_action(0) == SPU_CA9C_ACTION_DELIVER_SIGNAL &&
+        !spu_task_signal_generation_retry_candidate(
+            spu_task_signal_merge_pending(0), 0, 1, 15, 15, 41, 41, 19, 19) &&
+        !spu_task_signal_generation_retry_candidate(
+            0, 1, 1, 15, 15, 41, 41, 19, 19)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+
+    TEST("guest signal without CA9C debt remains a new level edge");
+    pending = spu_task_signal_merge_pending(0);
+    pending = spu_task_signal_merge_pending(pending);
+    uint16_t before_consume = pending;
+    pending = spu_task_signal_consume_pending(pending);
+    pending = spu_task_signal_merge_pending(pending);
+    if (before_consume == 1 && pending == 1) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+}
+
 /* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
@@ -415,8 +861,12 @@ int main(void) {
     test_selb();
     test_constant_generators();
     test_fsmbi();
+    test_gbh();
     test_sign_extend();
+    test_float_int_conversions();
     test_float_fused();
+    test_extended_float_masks();
+    test_task_signal_pending();
 
     printf("\nSPU helper tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

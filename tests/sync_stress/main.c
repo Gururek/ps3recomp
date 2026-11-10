@@ -89,6 +89,15 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size, uint3
     return 0;
 }
 
+int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
+                                     uint32_t args_ea, uint32_t taskset_ea,
+                                     uint32_t task_id)
+{
+    (void)image; (void)image_size; (void)args_ea;
+    (void)taskset_ea; (void)task_id;
+    return 0;
+}
+
 void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
 {
     (void)ctx; (void)tag;
