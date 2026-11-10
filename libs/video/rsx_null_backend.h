@@ -33,6 +33,9 @@ void rsx_null_backend_shutdown(void);
  * window was closed. */
 int rsx_null_backend_pump_messages(void);
 
+/* Frame commit for the title's present thread (headless: nothing to swap). */
+void rsx_null_backend_present(void);
+
 #ifdef __cplusplus
 }
 #endif

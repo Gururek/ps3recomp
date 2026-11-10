@@ -209,4 +209,9 @@ static inline uint64_t ppu_get_sp(const ppu_context* ctx)
 } /* extern "C" */
 #endif
 
+/* Indirect call through a PPC64 .opd import slot: read the code pointer the
+ * guest would have loaded and dispatch into the lifted/HLE registry. */
+struct ppu_context;
+void ppu_call_import(ppu_context* ctx, unsigned int slot);
+
 #endif /* PPU_CONTEXT_H */

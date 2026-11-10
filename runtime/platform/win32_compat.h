@@ -69,9 +69,29 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 
+/* The header's contract (see the Interlocked section below): every
+ * declaration here is C-linkage, matching the definitions in win32_compat.c.
+ * Without the wrapper, C++ translation units mangle the names and the archive
+ * never resolves them -- 71k undefined references at link. C++-only helpers
+ * that need overloads escape with `extern "C++"`. */
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Calling conventions. x86-64 collapses them, and GCC 16's C++ front end only
+ * spells __stdcall as a keyword in 32-bit mode, so map it onto the attribute
+ * (which the x86-64 back end accepts and ignores). */
+#if defined(__GNUC__) && !defined(__i386__)
+#define __cdecl
+#define __stdcall __attribute__((stdcall))
+#define __stdcallx(n) __attribute__((stdcall))
+#endif
+
+/* The declarations below are plain C; C++ translation units that call into
+ * win32_compat.c (ppu_loader.cpp, the title side) get C++-mangled prototypes
+ * here and C symbol names from the single definition -- which is what the
+ * upstream build does, and it keeps C++ headers pulled in afterwards (notably
+ * the templates in ps3emu/endian.h) out of C linkage. */
 
 /* ---------------------------------------------------------------------------
  * Scalar types and constants
@@ -1248,6 +1268,24 @@ static inline BOOL SetProcessInformation(HANDLE process, PROCESS_INFORMATION_CLA
 
 #ifndef MAX_PATH
 #define MAX_PATH 260
+#endif
+
+/* GCC's __declspec support predates -fdeclspec on this toolchain: map the MSVC
+ * spelling onto GCC attributes (the lifted PPU code uses __declspec(align(16)),
+ * the loader uses __declspec(thread)). */
+/* C++ has a native `align` keyword and accepts __declspec itself (GCC 11+);
+ * only the C front end needs the attribute spelling. */
+#if defined(__GNUC__) && !defined(__clang__) && !defined(_MSC_VER)
+/* No -fdeclspec on GCC 16's driver. C++ has `align` as an attribute alias, so
+ * the spelling passes through; C needs align(N) rewritten to aligned(N) (the
+ * lifted PPU code uses __declspec(align(16)), the loader __declspec(thread)). */
+#  if defined(__cplusplus)
+#    define __declspec(e) __attribute__((e))
+#  else
+#    define __declspec(e) __attribute__(declspec_gcc_map e)
+#    define declspec_gcc_map align(n) aligned(n)
+#  endif
+#endif
 
 /* Thread-local storage spelled the MSVC way (ppu_loader.cpp, dispatch_glue.cpp). */
 #if defined(_MSC_VER)
@@ -1271,7 +1309,104 @@ static inline BOOL SetProcessInformation(HANDLE process, PROCESS_INFORMATION_CLA
 #define VK_F10 0x79
 #define VK_F11 0x7A
 #define VK_F12 0x7B
-#endif
+#define VK_F13 0x7C
+#define VK_F14 0x7D
+#define VK_F15 0x7E
+#define VK_F16 0x7F
+#define VK_F17 0x80
+#define VK_F18 0x81
+#define VK_F19 0x82
+#define VK_F20 0x83
+#define VK_F21 0x84
+#define VK_F22 0x85
+#define VK_F23 0x86
+#define VK_F24 0x87
+#define VK_SPACE 0x20
+#define VK_RETURN 0x0D
+#define VK_BACK 0x08
+#define VK_TAB 0x09
+#define VK_SHIFT 0x10
+#define VK_CONTROL 0x11
+#define VK_MENU 0x12
+#define VK_PRIOR 0x21
+#define VK_NEXT 0x22
+#define VK_END 0x23
+#define VK_HOME 0x24
+#define VK_LEFT 0x25
+#define VK_UP 0x26
+#define VK_RIGHT 0x27
+#define VK_DOWN 0x28
+#define VK_SNAPSHOT 0x2C
+#define VK_CAPITAL 0x14
+#define VK_LSHIFT 0xA0
+#define VK_RSHIFT 0xA1
+#define VK_LCONTROL 0xA2
+#define VK_RCONTROL 0xA3
+#define VK_LMENU 0xA4
+#define VK_RMENU 0xA5
+#define VK_SEPARATOR 0x3C
+#define VK_APPS 0xDD
+#define VK_BROWSER_BACK 0xA6
+#define VK_BROWSER_FORWARD 0xA7
+#define VK_INSERT 0x2D
+#define VK_DELETE 0x2E
+#define VK_ESCAPE 0x1B
+#define VK_NUMPAD0 0x60
+#define VK_NUMPAD1 0x61
+#define VK_NUMPAD2 0x62
+#define VK_NUMPAD3 0x63
+#define VK_NUMPAD4 0x64
+#define VK_NUMPAD5 0x65
+#define VK_NUMPAD6 0x66
+#define VK_NUMPAD7 0x67
+#define VK_NUMPAD8 0x68
+#define VK_NUMPAD9 0x69
+#define VK_MULTIPLY 0x6A
+#define VK_ADD 0x6B
+#define VK_SUBTRACT 0x6D
+#define VK_DECIMAL 0x6E
+#define VK_DIVIDE 0x6F
+#define VK_LBUTTON 0X01
+#define VK_RBUTTON 0X02
+#define VK_CANCEL 0X03
+#define VK_MBUTTON 0X04
+#define VK_XBUTTON1 0X05
+#define VK_XBUTTON2 0X06
+#define VK_CLEAR 0X0C
+#define VK CAPITAL 0X14
+#define VK_EXECUTE 0X2B
+#define VK_HELP 0X2F
+#define VK_LWIN 0X5B
+#define VK_RWIN 0X5C
+#define VK_SLEEP 0X5F
+#define VK_VOLUME_MUTE 0XAD
+#define VK_VOLUME_DOWN 0XAE
+#define VK_VOLUME_UP 0XAF
+#define VK_MEDIA_NEXT_TRACK 0XB0
+#define VK_MEDIA_PREV_TRACK 0XB1
+#define VK_MEDIA_STOP 0XB2
+#define VK_MEDIA_PLAY_PAUSE 0XB3
+#define VK_BROWSER_REFRESH 0XA8
+#define VK_BROWSER_STOP 0XA9
+#define VK_BROWSER_SEARCH 0XAA
+#define VK_BROWSER_FAVORITES 0XAB
+#define VK_BROWSER_HOME 0XAC
+#define VK_CLEAR 0X0C
+#define VK_OEM_1 0xBA
+#define VK_OEM_PLUS 0xBB
+#define VK_OEM_COMMA 0xBC
+#define VK_OEM_MINUS 0xBD
+#define VK_OEM_PERIOD 0xBE
+#define VK_OEM_2 0xBF
+#define VK_OEM_3 0xC0
+#define VK_OEM_4 0xDB
+#define VK_OEM_5 0xDC
+#define VK_OEM_6 0xDD
+#define VK_OEM_7 0xDE
+#define VK_OEM_8 0xDF
+#define VK_OEM_CLEAR 0xFE
+#define VK_NUMLOCK 0x90
+#define VK_SCROLL 0x92
 
 typedef void* HINSTANCE;
 typedef void* HMODULE;

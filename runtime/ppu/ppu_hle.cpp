@@ -481,6 +481,12 @@ static void tj_pad_caller_trace(ppu_context* ctx)
     }
 }
 
+extern "C" 
+/* Per-thread name of the HLE handler in flight, for host-side diagnostics
+ * (dispatch_glue.cpp prints it when a guest access faults inside a call). */
+#define PS3_HLE_INFLIGHT_MAX 64
+extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     /* Preserve the caller TOC (r2) across the HLE call. ELFv1 makes r2 caller-saved

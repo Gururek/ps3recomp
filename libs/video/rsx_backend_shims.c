@@ -16,6 +16,7 @@
  */
 
 #include "rsx_d3d12_backend.h"
+#include "rsx_null_backend.h"
 
 #if !defined(_WIN32)
 
@@ -114,4 +115,31 @@ void rsx_d3d12_backend_note_exact_blit_fault(void) {}
 void rsx_d3d12_backend_pulse_fence_wait_service(void) {}
 void rsx_d3d12_backend_snapshot_late_resolve(void) {}
 
+
+/* Backend lifecycle + frame loop: the title binds these as "the" RSX backend,
+ * so on hosts without D3D12 they drive the null backend's window/frame state. */
+int  rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+{
+    return rsx_null_backend_init(width, height, title);
+}
+void rsx_d3d12_backend_shutdown(void) { rsx_null_backend_shutdown(); }
+int  rsx_d3d12_backend_pump_messages(void) { return rsx_null_backend_pump_messages(); }
+void rsx_d3d12_backend_present(void) { rsx_null_backend_present(); }
+
+/* Explicit-generation flip: the title names the framebuffer a completed GPU
+ * generation produced. Headless there is one surface, so it is a plain commit. */
+void rsx_d3d12_backend_present_buffer(u64 generation, u32 buffer_id)
+{
+    (void)generation; (void)buffer_id;
+    rsx_null_backend_present();
+}
+
+/* Survival-mode geometry trace arming (the D3D12 backend's own diagnostics). */
+void rsx_d3d12_arm_survival_trace(void) {}
+volatile long g_tj_geometry_trace_armed = 0;
+
 #endif /* !(_WIN32) */
+
+/* cellSpurs.c's RSX-survival trace switch: the D3D12 backend arms it from its
+ * own diagnostics; on hosts without D3D12 it stays off. */
+volatile long g_rsx_survival_trace_armed = 0;

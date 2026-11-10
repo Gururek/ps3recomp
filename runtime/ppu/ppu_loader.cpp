@@ -15,7 +15,7 @@
  * Game-agnostic: works on any decrypted PS3 PPU ELF. `vm_base` is owned by the
  * host (allocated large enough to cover the highest segment vaddr+memsz).
  *
- * Compiled as C++ to match the lifted output's `extern "C"` / __declspec(thread).
+ * Compiled as C++ to match the lifted output's `extern "C"` / PPU_THREAD_LOCAL.
  */
 
 #include "ppu_recomp.h"     /* ppu_context, func decls, ppu_recomp_register */
@@ -63,6 +63,44 @@ static constexpr uint64_t SYS_PPU_THREAD_EXIT = 42;
  * reservation semantics. stwcx is a sync point (rare vs vm_write), so a single
  * lock is cheap enough; shard by address later if it shows up in a profile.
  * -----------------------------------------------------------------------*/
+
+/* Null-pointer sweep bounds: while a run streams sequential small reads off
+ * NULL these track the high-water mark so the fast path can skip the check. */
+extern "C" uint32_t g_null_sweep_hi = 0;   /* 0 = not sweeping */
+extern "C" uint32_t g_null_sweep_last = 0;
+
+/* Name the innermost lifted function on the host stack: "func_001F2F30+0x44".
+ * The frame list is host code, so walk it against the lifter's function table
+ * and report the guest symbol the caller's return address belongs to. */
+extern "C" void ppu_guest_caller(char* out, size_t n)
+{
+    snprintf(out, n, "?");
+    void* fr[24]; unsigned short cnt = RtlCaptureStackBackTrace(0, 24, fr, 0);
+    for (unsigned short i = 0; i < cnt; i++) {
+        uintptr_t tgt = (uintptr_t)fr[i], best_h = 0; uint32_t best_g = 0;
+        for (uint64_t k = 0; k < function_table_count; k++) {
+            uintptr_t h = (uintptr_t)function_table[k].func;
+            if (h <= tgt && h > best_h) { best_h = h; best_g = function_table[k].addr; }
+        }
+        if (best_g && tgt - best_h < 0x20000) {
+            snprintf(out, n, "func_%08X+0x%llX", best_g,
+                     (unsigned long long)(tgt - best_h));
+            return;
+        }
+    }
+}
+
+/* --- master-era diagnostics the lifted code and HLE layer reference -------
+ * vm_inline_ok gates the lifter's inline fast path (0 = use the out-of-line
+ * accessors); g_sc_inflight records the sysprx call in flight per thread;
+ * ppu_guest_callstack prints the host stack mapped back onto guest symbols. */
+extern "C" int vm_inline_ok = 0;
+extern "C" int vm_inline_st_ok = 0;
+
+#define PS3_SC_INFLIGHT_MAX 64
+extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
+
+
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* fwd (defined below) */
 #define PPU_RESV_MAX 128
 #define PPU_RESV_INVALID 0x100000000ull   /* out of (uint32_t) ea range */
@@ -430,8 +468,8 @@ static void vm_hotmap(uint32_t ea, int width)
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;  /* fwd decl (defined below) */
 /* Tracks the most recent vm_read32 {addr,value} on this thread, so FLOW_WVAL can
  * report the SOURCE a copied value came from (poison propagation vs true origin). */
-static __declspec(thread) uint32_t g_last_rd_addr = 0;
-static __declspec(thread) uint32_t g_last_rd_val  = 0;
+static PPU_THREAD_LOCAL uint32_t g_last_rd_addr = 0;
+static PPU_THREAD_LOCAL uint32_t g_last_rd_val  = 0;
 /* PT=<hex>: persistent high-byte truncation detector. A write8 that turns the word
  * at some addr into <hex> (e.g. a heap ptr 0x471057A0 zeroed to 0x001057A0) is BENIGN
  * if the word is later restored to a full pointer; it is the BUG if the truncated
@@ -460,8 +498,8 @@ static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr
 #endif
 /* Stack of currently-executing indirect-call (vtable) targets on this thread, so a
  * write hook can name the virtual method that is running when it writes a value. */
-static __declspec(thread) uint32_t g_vcall_stk[128];
-static __declspec(thread) int      g_vcall_sp = 0;
+static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
+static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
 extern "C" {
 uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
     /* YDKJ_LV2_SAT (diagnostic): the game polls 0x00543580 ("Continue... (Lv-2 is
@@ -473,7 +511,7 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read8  0x%08X ra0=%p ra1=%p\n", (uint32_t)a, __builtin_return_address(0), __builtin_return_address(1)); }
 #endif
-    { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
+    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) {
           fprintf(stderr, "[HOTREAD8] spinning on 0x%08X val=0x%02X tid=%lu guest-fn=0x%08X\n",
                   (uint32_t)a, vm_base[(uint32_t)a], GetCurrentThreadId(),
@@ -482,7 +520,7 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
       else { last=(uint32_t)a; n=0; } }
     return vm_base[(uint32_t)a]; }
 uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
-    { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
+    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
@@ -571,7 +609,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
           for(uint32_t i=0;i<NB;i++) cnt[i]=0; } } }
     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
-    { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
+    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X)\n", (uint32_t)a, __builtin_bswap32(v)); n=0;
 #ifdef _WIN32
         /* YDKJ_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin
@@ -593,7 +631,7 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
 #endif
-    { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
+    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD64] spinning on 0x%08X (=0x%016llX)\n", (uint32_t)a, (unsigned long long)__builtin_bswap64(v)); n=0;
 #ifdef _WIN32
         { static int64_t wa=-2; if(wa==-2){const char*e=getenv("YDKJ_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
@@ -635,7 +673,7 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                       a, v, width, ppu_prof_resolve_host(ra));
               /* On the first write to the watched word, dump the guest caller
                * chain so the origin of a null field can be walked up-stack. */
-              extern __declspec(thread) ppu_context* g_active_ctx;
+              extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
               extern void ppu_dump_guest_stack(ppu_context*, const char*);
               if (_n == 1 && g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "ww");
           }
@@ -886,11 +924,11 @@ void flow_lookup_alloc(unsigned int p) {
 }
 
 /* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */
-extern "C" __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;
+extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
 
 /* Per-thread active guest context, for the crash handler to report the guest PC
  * (ctx->pc, updated by lifted code at block boundaries) of a host AV. */
-extern "C" __declspec(thread) ppu_context* g_active_ctx = nullptr;
+extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx = nullptr;
 
 /* Caller LR of the guest function currently in an HLE call (for HLE-side
  * diagnostics: pin which lifted function invoked us). 0 if none. */
@@ -974,6 +1012,34 @@ static ppu_fn ppu_lookup(uint32_t a)
         i = (i + 1) & PPU_HASH_MASK;
     }
     return nullptr;
+}
+
+/* An indirect call through an import slot.
+
+The PPC64 model puts a function descriptor (code pointer, TOC) in .opd, and the
+lifter emits `bl` to a slot it cannot resolve as a lifted function as a comment,
+which drops the call entirely: the callee never runs and r3 keeps the argument.
+~7,000 sites in the Tokyo Jungle lift are these slots, and they carry the whole
+import surface (cellGcm*, sys_*, the CRT's allocator). This reads the slot the
+way the guest's `bl`+`bctr` pair would and dispatches into the registry, so the
+callee runs for real. */
+void ppu_call_import(ppu_context* ctx, uint32_t slot)
+{
+    uint32_t code = vm_read32(slot);
+    if (!code) {
+        if (getenv("TJ_IMPTRACE"))
+            printf("[imp] slot 0x%08X EMPTY (lr=0x%08X)\n", slot, (uint32_t)ctx->lr);
+        return;                              /* slot never populated: keep r3 */
+    }
+    ppu_fn fn = ppu_lookup(code);
+    if (!fn) {
+        if (getenv("TJ_IMPTRACE"))
+            printf("[imp] slot 0x%08X -> 0x%08X NOT IN TABLE\n", slot, code);
+        return;
+    }
+    if (getenv("TJ_IMPTRACE"))
+        printf("[imp] slot 0x%08X -> 0x%08X\n", slot, code);
+    fn(ctx);
 }
 
 extern "C" uint32_t ppu_function_count(void) { return g_fn_count; }
@@ -1933,7 +1999,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
 
     /* Private scratch stack high in the guest stack region, distinct from the
      * main + ppu_thread stacks. One callback at a time per caller thread. */
-    static __declspec(thread) uint32_t s_cb_sp = 0;
+    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
     if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
 
     ppu_context ctx;
@@ -1986,7 +2052,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
-    static __declspec(thread) uint32_t s_cb_sp = 0;
+    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
     if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
 
     ppu_context ctx;

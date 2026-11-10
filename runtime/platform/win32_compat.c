@@ -35,6 +35,9 @@
 #endif
 
 #include "win32_compat.h"
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <unistd.h>
 
 #include <errno.h>
 #include <signal.h>
@@ -2042,3 +2045,39 @@ int _putenv_s(const char* name, const char* value)
 /* Nothing to build: the header is a passthrough to <windows.h> there. */
 typedef int ps3_win32_compat_not_needed_on_windows;
 #endif
+/* ---------------------------------------------------------------------------
+ * Module handles and stack walks (added for POSIX).
+ *
+ * Both exist only for diagnostics: ppu_loader.cpp uses them to print a host
+ * RVA + module name when a guest access faults. A "module" is the shared
+ * object (or the main program) an address came from -- exactly what dladdr
+ * reports -- and the "process handle" is Windows' pseudo-handle value, which
+ * callers only ever pass back in.
+ * ------------------------------------------------------------------------- */
+
+BOOL GetModuleHandleExA(DWORD flags, LPCSTR name, HMODULE* out) {
+    if (!out) return 0;
+    if (flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
+        Dl_info info;
+        if (!dladdr((const void*)name, &info) || !info.dli_fbase) return 0;
+        *out = (HMODULE)info.dli_fbase;
+        return 1;
+    }
+    *out = GetModuleHandleA(name);
+    return *out != NULL;
+}
+
+/* frames_to_skip frames above this one, up to frames_to_capture of them, into
+ * out_frames; returns how many were stored. The hash is a hint we do not keep. */
+WORD RtlCaptureStackBackTrace(DWORD frames_to_skip, DWORD frames_to_capture,
+                              void** out_frames, PDWORD hash) {
+    (void)hash;
+    if (!out_frames || frames_to_capture == 0) return 0;
+    void* raw[96];
+    int n = backtrace(raw, (int)(frames_to_skip + frames_to_capture) + 1);
+    if (n <= (int)frames_to_skip) return 0;
+    n -= (int)frames_to_skip;
+    if (n > (int)frames_to_capture) n = (int)frames_to_capture;
+    for (int i = 0; i < n; i++) out_frames[i] = raw[frames_to_skip + i];
+    return (WORD)n;
+}

@@ -1,4 +1,8 @@
 /* Shared SPU reservation-line ownership and HLE atomic guest-memory updates. */
+/* Coherency bitmap: an SPU that owns lines marks them here so main-memory
+ * readers know which SPU-local lines are live. NULL until the first reserve.
+ * (Newer runtimes keep this in spu_coh_bitmap.h / spu_coherency.c.) */
+const unsigned char* g_spu_coh_bits = 0;
 
 #include "spu_reservation.h"
 

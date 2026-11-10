@@ -7,6 +7,9 @@
  *
  * Actual rendering is handled elsewhere -- this module just tracks state.
  */
+/* Where the HLE layer injects the argument block a cellGcm* call passes to the
+ * guest (the lifter reads it back through this base). master keeps it here too. */
+uint32_t ppu_hle_inject_base = 0x20000000u;
 
 #include "cellGcmSys.h"
 #include "rsx_ordered_display_alias.h"
@@ -16,9 +19,12 @@
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "rsx_scaled_blit.h"
 #include "rsx_boundary_policy.h"
-#ifdef _WIN32
+/* The GCM front end drives the RSX through the backend-neutral rsx_state plus
+ * the D3D12 backend's completion/boundary API. On POSIX hosts that API is
+ * implemented by rsx_vulkan_backend.c, with rsx_backend_shims.c covering the
+ * pieces the Vulkan backend has no equivalent for -- so take the declarations
+ * (and RsxD3D12CompletionReason) on every host. */
 #include "rsx_d3d12_backend.h"
-#endif
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
@@ -212,6 +218,19 @@ static u64 get_timestamp_ns(void)
     return (u64)((double)now.QuadPart * 1000000000.0 / (double)s_qpc_freq.QuadPart);
 }
 #else
+/* The compat layer maps QueryPerformanceCounter onto a nanosecond monotonic
+ * clock, so the "frequency" is 1e9 and the init flag only has to be set. */
+static LARGE_INTEGER s_qpc_freq;
+static int           s_qpc_init = 0;
+
+static void ensure_qpc_init(void)
+{
+    if (!s_qpc_init) {
+        QueryPerformanceFrequency(&s_qpc_freq);
+        s_qpc_init = 1;
+    }
+}
+
 static u64 get_timestamp_ns(void)
 {
     struct timespec ts;

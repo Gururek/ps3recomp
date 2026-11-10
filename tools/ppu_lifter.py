@@ -292,8 +292,12 @@ extern "C" void ps3_indirect_call(ppu_context* ctx);
 extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
 
 /* Trampoline function pointer for cross-fragment branches (TLS).
- * Must match the __declspec(thread) definition in indirect_dispatch. */
-extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
+ * One spelling on every host: GCC 16 puts `__declspec(thread)` (which it maps
+ * to the ignored `thread` attribute on x86-64) and `thread_local` in different
+ * ELF sections, and a declaration/definition split across them is a link
+ * error. PPU_THREAD_LOCAL (runtime/platform/win32_compat.h) picks the right
+ * one per compiler, matching the definition in runtime/ppu/ppu_loader.cpp. */
+extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 
 /* Drain pending trampolines after any call that might set g_trampoline_fn.
  * Converts cross-fragment fallthrough chains into iterative loops. */
@@ -433,6 +437,7 @@ class PPULifter:
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
+        self.import_slots: set[int] = set()  # .opd slots reached by bl/b
         # Addresses that begin a function prologue (stdu r1,-N, adjusted back to a
         # preceding mflr r0). A `b` to one of these is always a TAIL CALL, even
         # when the target sits inside the current (merged) function's range -- so
@@ -1287,7 +1292,8 @@ class PPULifter:
                 elif self.code_hi is not None and not (self.code_lo <= tgt < self.code_hi):
                     # Target is outside the executable window -> data misread as
                     # a branch. Don't seed a bogus func_X; just leave the fragment.
-                    return f"return; /* b -> non-code 0x{tgt:08X} */"
+                    self.import_slots.add(tgt)
+                    return f"ppu_call_import(ctx, 0x{tgt:08X}); return; /* b -> import slot */"
                 else:
                     # Use trampoline for cross-fragment branches to avoid
                     # stack-growing recursion when backward branches re-enter
@@ -1302,7 +1308,15 @@ class PPULifter:
             try:
                 tgt = int(target, 16)
                 if self.code_hi is not None and not (self.code_lo <= tgt < self.code_hi):
-                    return f"/* bl -> non-code 0x{tgt:08X} */;"
+                    # PPC64 function descriptor (.opd) slot: the guest loads the
+                    # code pointer from the slot and branches, so the callee is
+                    # only known at runtime. Emit the load-and-dispatch the guest
+                    # would do -- a comment here dropped the call, leaving r3 as
+                    # the argument, and the ~7,000 import slots of a Tokyo Jungle
+                    # lift are the whole HLE surface.
+                    self.import_slots.add(tgt)
+                    return (f"ctx->lr = 0x{insn.addr + 4:08X}; "
+                            f"ppu_call_import(ctx, 0x{tgt:08X}); DRAIN_TRAMPOLINE(ctx);")
                 func.calls.append(tgt)
                 self.call_targets.add(tgt)
                 # PPC `bl` sets LR = return address (next instr). Emit it so mflr

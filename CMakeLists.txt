@@ -41,6 +41,15 @@ file(GLOB_RECURSE HLE_SOURCES
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 
 # Runtime core (syscalls, PPU, SPU, memory)
+# The D3D12 backend is the reference implementation of the rsx_d3d12_backend_*
+# surface that cellGcmSys calls. Hosts without D3D12 get libs/video/
+# rsx_backend_shims.c, which maps that surface onto the Vulkan backend, so the
+# D3D12 TU is compiled out there (its 16 definitions would otherwise collide
+# with the shim's at link).
+if(NOT WIN32)
+    list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_d3d12_backend\\.c$")
+endif()
+
 file(GLOB_RECURSE RUNTIME_SOURCES
     "runtime/*.c"
     "runtime/*.cpp"
@@ -53,6 +62,11 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 #    backend), not as part of the game-agnostic runtime library. See
 #    docs/PPU_RECOMP.md.
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/")
+# The runtime/ppu list is compiled per-game (see the note below), and the
+# guest-pointer trap has no game-specific part, so it rides with the runtime.
+list(APPEND RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu/guest_ptr_trap.cpp")
+
+
 
 # ---------------------------------------------------------------------------
 # Static library
@@ -114,6 +128,38 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+endif()
+
+# On non-Windows hosts cellPad/cellAudio are SDL2-backed (cellPad uses the
+# controllers, cellAudio the audio device), so the runtime needs SDL2 there.
+if(NOT WIN32)
+    find_package(SDL2 QUIET)               # distro config, exports SDL2::SDL2
+    if(NOT SDL2_FOUND)
+        find_package(SDL2 CONFIG QUIET)    # e.g. /usr/lib/cmake/SDL2 on Arch
+    endif()
+    # The null RSX backend's POSIX branch clears through the fixed-function
+    # OpenGL pipeline, which SDL's context provides.
+    find_package(OpenGL QUIET)
+    if(TARGET OpenGL::GL)
+        target_link_libraries(ps3recomp_runtime PUBLIC OpenGL::GL)
+        message(STATUS "  OpenGL: null RSX backend window clear")
+    endif()
+    if(TARGET SDL2::SDL2)
+        target_link_libraries(ps3recomp_runtime PUBLIC SDL2::SDL2)
+        if(TARGET SDL2::SDL2main)
+            # A static lib must not drag in SDL_main's main() remangling.
+            target_link_libraries(ps3recomp_runtime PUBLIC SDL2::SDL2)
+        endif()
+        message(STATUS "  SDL2: $<TARGET_FILE:SDL2::SDL2> (cellPad/cellAudio backend)")
+    elseif(SDL2_INCLUDE_DIRS)
+        target_include_directories(ps3recomp_runtime PUBLIC ${SDL2_INCLUDE_DIRS})
+        target_link_libraries(ps3recomp_runtime PUBLIC ${SDL2_LIBRARIES})
+        message(STATUS "  SDL2: via pkg-config ${SDL2_LIBRARIES}")
+    else()
+        message(FATAL_ERROR
+            "cellPad/cellAudio need SDL2 on this platform. Install it (Arch: "
+            "lib32-sdl2/sdl2) and reconfigure.")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

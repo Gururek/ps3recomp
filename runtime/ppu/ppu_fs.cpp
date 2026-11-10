@@ -45,7 +45,7 @@ extern "C" void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
 extern "C" char __ImageBase;
-extern "C" unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long,unsigned long,void**,unsigned long*);
+extern "C" unsigned short __stdcall RtlCaptureStackBackTrace(DWORD,DWORD,void**,PDWORD);  /* host-independent widths: LP64 unsigned long is 64-bit */
 
 /* Host root that the PS3 mount points map into (dir containing PS3_GAME). */
 extern "C" const char* ppu_vfs_root = ".";
