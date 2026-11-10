@@ -107,6 +107,7 @@ typedef unsigned short     USHORT;
 #endif
 typedef short              SHORT;
 typedef uint32_t           DWORD;
+typedef DWORD*             PDWORD;
 typedef uint32_t           ULONG;
 typedef uint32_t           UINT;
 typedef int32_t            LONG;      /* 32-bit, as on Windows -- see the header comment */

@@ -5,7 +5,12 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#ifdef _WIN32
 #include <intrin.h>
+#else
+#include <x86intrin.h>   /* _mm_lfence et al. */
+#include <intrin.h>
+#endif
 #include <stddef.h>
 #include <string.h>
 

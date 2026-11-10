@@ -179,6 +179,15 @@ typedef struct CellSaveDataDirStat {
     char dirName[CELL_SAVEDATA_DIRNAME_SIZE];
 } CellSaveDataDirStat;
 
+/* glibc's <bits/struct_stat.h> spells st_atime/st_mtime/st_ctime as field
+ * designators (st_atim.tv_nsec); undefine them so the guest struct members
+ * keep their names on POSIX hosts. */
+#if !defined(_WIN32)
+#undef st_atime
+#undef st_mtime
+#undef st_ctime
+#endif
+
 typedef struct CellSaveDataFileStat {
     u32  fileType;
     char reserved1[4];

@@ -1,3 +1,6 @@
+#ifndef PS3RECOMP_CELLFIBER_H
+#define PS3RECOMP_CELLFIBER_H
+
 /*
  * ps3recomp - cellFiber HLE
  *
@@ -92,3 +95,5 @@ s32 cellFiberPpuWakeup(CellFiber fiber);
 #endif
 
 #endif /* PS3RECOMP_CELL_FIBER_H */
+
+#endif /* PS3RECOMP_CELLFIBER_H */
