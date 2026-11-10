@@ -172,21 +172,24 @@ typedef struct CellSaveDataSystemFileParam {
     char reserved[256];
 } CellSaveDataSystemFileParam;
 
+/* glibc's <bits/struct_stat.h> spells these as field designators
+ * (st_atim.tv_nsec); re-define-then-undef drops the macro, because #undef
+ * expands its identifier. */
+#if !defined(_WIN32)
+#define st_atime st_atime
+#undef st_atime
+#define st_mtime st_mtime
+#undef st_mtime
+#define st_ctime st_ctime
+#undef st_ctime
+#endif
+
 typedef struct CellSaveDataDirStat {
     s64  st_atime;
     s64  st_mtime;
     s64  st_ctime;
     char dirName[CELL_SAVEDATA_DIRNAME_SIZE];
 } CellSaveDataDirStat;
-
-/* glibc's <bits/struct_stat.h> spells st_atime/st_mtime/st_ctime as field
- * designators (st_atim.tv_nsec); undefine them so the guest struct members
- * keep their names on POSIX hosts. */
-#if !defined(_WIN32)
-#undef st_atime
-#undef st_mtime
-#undef st_ctime
-#endif
 
 typedef struct CellSaveDataFileStat {
     u32  fileType;

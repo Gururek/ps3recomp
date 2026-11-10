@@ -70,12 +70,15 @@ extern "C" {
  * bytes (RPCS3 sys_fs.h: be_t<s64,4>, CHECK_SIZE_ALIGN(CellFsStat,52,4)).
  * Without #pragma pack the host would 8-align the s64s, putting st_size at +0x28
  * (56-byte struct) and the guest would read its size from the wrong offset. */
-/* glibc's <bits/struct_stat.h> spells st_atime/st_mtime/st_ctime as field
- * designators (st_atim.tv_nsec); undefine them so the guest struct members
- * keep their names on POSIX hosts. */
+/* glibc's <bits/struct_stat.h> spells these as field designators
+ * (st_atim.tv_nsec); re-define-then-undef drops the macro, because #undef
+ * expands its identifier. */
 #if !defined(_WIN32)
+#define st_atime st_atime
 #undef st_atime
+#define st_mtime st_mtime
 #undef st_mtime
+#define st_ctime st_ctime
 #undef st_ctime
 #endif
 

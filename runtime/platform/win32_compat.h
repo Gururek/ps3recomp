@@ -1248,6 +1248,29 @@ static inline BOOL SetProcessInformation(HANDLE process, PROCESS_INFORMATION_CLA
 
 #ifndef MAX_PATH
 #define MAX_PATH 260
+
+/* Thread-local storage spelled the MSVC way (ppu_loader.cpp, dispatch_glue.cpp). */
+#if defined(_MSC_VER)
+#define PPU_THREAD_LOCAL __declspec(thread)
+#elif defined(__cplusplus) && __cplusplus >= 201103L
+#define PPU_THREAD_LOCAL thread_local
+#else
+#define PPU_THREAD_LOCAL _Thread_local
+#endif
+
+/* Virtual-key codes for the function keys (in-game rebinding, tj_prompt_text). */
+#define VK_F1 0x70
+#define VK_F2 0x71
+#define VK_F3 0x72
+#define VK_F4 0x73
+#define VK_F5 0x74
+#define VK_F6 0x75
+#define VK_F7 0x76
+#define VK_F8 0x77
+#define VK_F9 0x78
+#define VK_F10 0x79
+#define VK_F11 0x7A
+#define VK_F12 0x7B
 #endif
 
 typedef void* HINSTANCE;

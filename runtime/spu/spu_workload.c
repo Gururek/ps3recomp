@@ -14,8 +14,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Big-endian guest accessor from ppu_loader.cpp. */
+/* Big-endian guest accessor from ppu_loader.cpp. The header's `static inline`
+ * definitions and these prototypes have to agree, so take the definitions from
+ * the header on POSIX hosts and keep the extern prototype only for MSVC. */
+#if defined(_MSC_VER)
 extern uint64_t vm_read64(uint32_t ea);
+#else
+#include "../ppu/ppu_memory.h"
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include <malloc.h>

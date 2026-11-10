@@ -301,11 +301,19 @@ static inline void lv2_syscall_dispatch(lv2_syscall_table* tbl, ppu_context* ctx
     ctx->gpr[3] = (uint64_t)handler(ctx);
 }
 
-/* Convenience wrapper using the global table */
+/* Convenience wrapper using the global table. ppu_loader.cpp ships the real
+ * definition (a boot-tuned fast path over the syscalls the CRT needs), so in
+ * C++ translation units -- which compile ppu_loader.cpp directly -- declare it
+ * and let that definition win; in C translation units keep the inline wrapper
+ * as the fallback dispatcher. */
+#if defined(__cplusplus)
+extern void lv2_syscall(ppu_context* ctx);
+#else
 static inline void lv2_syscall(ppu_context* ctx)
 {
     lv2_syscall_dispatch(&g_lv2_syscalls, ctx);
 }
+#endif
 
 /* ---------------------------------------------------------------------------
  * Argument extraction macros for syscall handlers
