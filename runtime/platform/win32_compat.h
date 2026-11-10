@@ -61,6 +61,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 #include <sched.h>
@@ -1239,6 +1240,45 @@ typedef struct {
 static inline BOOL SetProcessInformation(HANDLE process, PROCESS_INFORMATION_CLASS cls,
                                          LPVOID info, DWORD size)
 { (void)process; (void)cls; (void)info; (void)size; return TRUE; }
+
+/* ---------------------------------------------------------------------------
+ * Module handle + the CRT names the title-side code uses
+ * -------------------------------------------------------------------------*/
+
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
+
+typedef void* HINSTANCE;
+typedef void* HMODULE;
+
+/* There is no module table to look into; every caller only uses the handle as
+ * an identity token (path of the running executable). */
+HMODULE GetModuleHandleA(LPCSTR name);
+
+#define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS       0x1u
+#define GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT 0x2u
+typedef void* HMODULE_EX;
+
+/* One-shot handle request. Both flags mean the same thing here: there are no
+ * modules, so any address resolves to the main executable's identity token. */
+BOOL GetModuleHandleExA(DWORD flags, LPCSTR name, HMODULE* out);
+
+/* Stack walks (ppu_loader's diagnostic backtraces). */
+WORD RtlCaptureStackBackTrace(DWORD frames_to_skip, DWORD frames_to_capture,
+                              void** backtrace, PDWORD hash);
+
+/* The current process, for GetProcessTimes/GetExitCodeProcess callers. */
+HANDLE GetCurrentProcess(void);
+
+/* _fullpath: absolute, normalised path into `out` (cap bytes, MSVC's cap of 0
+ * means "use PATH_MAX"). Returns out, like the CRT. */
+char* _fullpath(char* out, const char* in, size_t cap);
+
+int _putenv_s(const char* name, const char* value);
+
+#define _stricmp  strcasecmp
+#define _strnicmp strncasecmp
 
 #ifdef __cplusplus
 } /* extern "C" */

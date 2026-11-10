@@ -2008,6 +2008,36 @@ LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_F
         __atomic_exchange_n(&s_top_filter, filter, __ATOMIC_ACQ_REL);
 }
 
+/* ---------------------------------------------------------------------------
+ * Module handle + CRT names
+ * -------------------------------------------------------------------------*/
+
+HMODULE GetModuleHandleA(LPCSTR name)
+{
+    /* Identity token only: a stable non-NULL pointer that every caller in the
+     * tree compares against NULL / uses with GetModuleFileNameA. */
+    (void)name;
+    static char s_module_anchor;
+    return (HMODULE)&s_module_anchor;
+}
+
+char* _fullpath(char* out, const char* in, size_t cap)
+{
+    if (!in) return NULL;
+    if (cap == 0) cap = PATH_MAX;
+    if (realpath(in, out)) return out;
+    /* realpath fails on missing files; MSVC's _fullpath normalises anyway. */
+    snprintf(out, cap, "%s", in);
+    return out;
+}
+
+int _putenv_s(const char* name, const char* value)
+{
+    if (!name) return EINVAL;
+    if (!value) value = "";
+    return setenv(name, value, 1) == 0 ? 0 : errno;
+}
+
 #else  /* _WIN32 */
 /* Nothing to build: the header is a passthrough to <windows.h> there. */
 typedef int ps3_win32_compat_not_needed_on_windows;

@@ -77,9 +77,16 @@ if(NOT WIN32)
     target_include_directories(ps3recomp_runtime PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
     )
+    # CPU_SET / pthread_setaffinity_np / REG_RIP in win32_compat, and the
+    # __declspec(thread)/align spelling the PPU sources use under -fdeclspec.
+    target_compile_definitions(ps3recomp_runtime PRIVATE _GNU_SOURCE)
     target_compile_options(ps3recomp_runtime PRIVATE
         -include "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/win32_compat.h"
     )
+endif()
+
+if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
+    target_compile_options(ps3recomp_runtime PRIVATE -fdeclspec)
 endif()
 
 # HLE modules include their own headers

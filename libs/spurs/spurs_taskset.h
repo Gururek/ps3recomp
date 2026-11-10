@@ -21,11 +21,18 @@
 #include <stdint.h>
 
 /* BE guest-memory accessors (defined in runtime/ppu/ppu_loader.cpp).
- * Signatures match runtime/ppu/ppu_memory.h (32-bit guest EA). */
+ * Signatures match runtime/ppu/ppu_memory.h (32-bit guest EA). clang wants the
+ * extern prototypes and the header's `static inline` definitions to agree, so
+ * take the definitions from the header on every host and keep the prototypes
+ * only where MSVC needs them. */
+#if defined(_MSC_VER)
 uint32_t vm_read32(uint32_t ea);
 uint64_t vm_read64(uint32_t ea);
 void     vm_write32(uint32_t ea, uint32_t v);
 void     vm_write64(uint32_t ea, uint64_t v);
+#else
+#include "../../runtime/ppu/ppu_memory.h"
+#endif
 
 /* ---- CellSpursTaskset (main memory, 128-byte aligned) --------------------
  * The PM reads the task bitsets to pick a ready task and the TaskInfo array for
