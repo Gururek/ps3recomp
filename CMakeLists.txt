@@ -66,6 +66,22 @@ target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
+# ---------------------------------------------------------------------------
+# POSIX build: the HLE modules and runtime core are written against the Win32
+# threading/timing API (SRWLOCK, CONDITION_VARIABLE, QueryPerformanceCounter,
+# GetTickCount64, Interlocked*, VirtualAlloc, ...). runtime/platform/win32_compat
+# implements all of it on pthreads; force-including it means every TU sees the
+# same declarations without touching the per-file `#ifdef _WIN32` blocks.
+# ---------------------------------------------------------------------------
+if(NOT WIN32)
+    target_include_directories(ps3recomp_runtime PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+    )
+    target_compile_options(ps3recomp_runtime PRIVATE
+        -include "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/win32_compat.h"
+    )
+endif()
+
 # HLE modules include their own headers
 target_include_directories(ps3recomp_runtime PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/system"
