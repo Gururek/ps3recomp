@@ -1692,6 +1692,26 @@ static void pad_poll_sdl2(void)
         s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
         s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
     }
+
+    /* An empty port list is a pad state, not a missing device. The XInput path
+     * keeps port 0 connected for its keyboard mapper (see pad_poll_keyboard);
+     * SDL2 has no such mapper, so with no gamepad attached every port read
+     * disconnected. Tokyo Jungle gates boot on the connected-pad count that
+     * cellPadInit returns, so it polled the call in a tight loop:
+     *   [WATCHDOG] ... LR=0x001F61EC CTR=0x01180648 (cellPadInit) [STUCK]
+     * Report port 0 as an idle virtual pad, matching the Windows keyboard.
+     * PS3_PAD_DISABLE_KEYBOARD=1 drops it, as on Windows. */
+    if (!s_host_state[0].connected && !s_sdl_controllers[0]) {
+        static int virtual_pad = -1;
+        if (virtual_pad < 0)
+            virtual_pad = getenv("PS3_PAD_DISABLE_KEYBOARD") ? 0 : 1;
+        if (virtual_pad) {
+            memset(&s_host_state[0], 0, sizeof(s_host_state[0]));
+            s_host_state[0].connected = 1;
+            s_host_state[0].analog_lx = s_host_state[0].analog_ly = 128;
+            s_host_state[0].analog_rx = s_host_state[0].analog_ry = 128;
+        }
+    }
 }
 
 static void pad_init_backend(void)
@@ -1776,9 +1796,18 @@ s32 cellPadInit(u32 max_connect)
     /* Do an initial poll to detect connected controllers */
     pad_state_lock();
     pad_poll_backend();
+
+    /* PS3's cellPadInit returns the number of ports connected, not CELL_OK,
+     * and the title gates boot on that count:
+     *   do { r3 = cellPadInit(4); } while (r3 == 0);
+     * Returning 0 (CELL_OK) parked the boot in that loop. */
+    u32 ports = 0;
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+        if (s_host_state[i].connected) ports++;
     pad_state_unlock();
 
-    return CELL_OK;
+    printf("[cellPad] Init: %u port(s) connected\n", ports);
+    return (s32)ports;
 }
 
 s32 cellPadEnd(void)
