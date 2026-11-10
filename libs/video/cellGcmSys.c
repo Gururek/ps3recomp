@@ -606,6 +606,23 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     GCM_USER_PENDING_STORE(0);
 
     /* Set up the initial IO mapping for the command buffer region */
+    if (ioAddress != 0 && ioSize == 0) {
+        /* Titles that pass ioSize = 0 (Tokyo Jungle: _cellGcmInitBody(0, 0,
+         * 0x02100000)) mean "the classic local-memory window", not "no local
+         * memory": the command buffer, the three frame buffers and the zcull
+         * tiles all live at io offsets the title then addresses from io 0
+         * (SetTile offsets 0x0/0x3A0000/0x740000, size 0x3A0000 each). With no
+         * window registered, io 0 resolved to nothing, so the very first drain
+         * -- get = 0, put = 0x1000FC -- reported "get=0x0 has no IO mapping"
+         * and resynchronised to put. The whole first command buffer, fences
+         * included, was skipped, ctrl->ref never advanced, and the game parked
+         * in `while (ctrl->ref != want) sys_timer_usleep(30)`. 16 MB is the
+         * usual SDK local size and covers every offset this title uses. */
+        ioSize = 0x1000000;
+        s_config.ioSize = ioSize;
+        printf("[cellGcmSys] ioSize=0: defaulting the IO window to 0x%X at "
+               "io 0 (ea 0x%08X)\n", ioSize, ioAddress);
+    }
     if (ioAddress != 0 && ioSize > 0) {
         populate_offset_table(ioAddress, 0, ioSize);
 
