@@ -50,6 +50,28 @@ if(NOT WIN32)
     list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_d3d12_backend\\.c$")
 endif()
 
+# The Vulkan RSX backend is the POSIX graphics path. It implements the same
+# rsx_backend vtable the null backend does, plus the rsx_d3d12_backend_*
+# surface cellGcmSys calls, so enabling it swaps the window's content from a
+# fixed-function clear to the real RSX command stream. It loads libvulkan at
+# run time, so building needs only the Vulkan headers.
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
+list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
+if(PS3RECOMP_RSX_VULKAN)
+    if(WIN32 OR APPLE)
+        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
+    endif()
+    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
+    if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
+        message(FATAL_ERROR "Vulkan headers not found. Debian/Ubuntu: "
+            "libvulkan-dev, Fedora: vulkan-headers -- or pass "
+            "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
+    endif()
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
+    # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
+endif()
+
 file(GLOB_RECURSE RUNTIME_SOURCES
     "runtime/*.c"
     "runtime/*.cpp"
@@ -119,6 +141,16 @@ target_include_directories(ps3recomp_runtime PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
+
+# Vulkan: headers for the backend, and the definition is PUBLIC because the
+# application picks its backend (null / Vulkan / D3D12) on it.
+if(PS3RECOMP_RSX_VULKAN)
+    target_include_directories(ps3recomp_runtime PRIVATE
+        "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+    target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
+    target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
+    message(STATUS "  Vulkan:       RSX backend enabled (headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
+endif()
 
 # Platform-specific link libraries
 if(WIN32)

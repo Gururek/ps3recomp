@@ -22,59 +22,12 @@
 
 #if defined(PS3RECOMP_RSX_VULKAN)
 #include "rsx_vulkan_backend.h"
+#endif
 
-int rsx_d3d12_backend_complete_fifo_prefix(void)
-{
-    return rsx_vulkan_backend_complete_fifo_prefix_at(RSX_COMPLETION_DRAIN);
-}
-
-int rsx_d3d12_backend_complete_fifo_prefix_at(RsxD3D12CompletionReason reason)
-{
-    return rsx_vulkan_backend_complete_fifo_prefix_at(reason);
-}
-
-int rsx_d3d12_backend_complete_local_main_prefix(void)
-{
-    return rsx_vulkan_backend_complete_local_main_prefix_at(RSX_COMPLETION_DRAIN);
-}
-
-int rsx_d3d12_backend_prepare_texture_label(void)
-{
-    return rsx_vulkan_backend_prepare_texture_label();
-}
-
-int rsx_d3d12_backend_flush_texture_labels(void)
-{
-    return rsx_vulkan_backend_flush_texture_labels();
-}
-
-int rsx_d3d12_backend_flush_texture_labels_at(RsxD3D12CompletionReason reason)
-{
-    return rsx_vulkan_backend_flush_texture_labels_at(reason);
-}
-
-int rsx_d3d12_backend_acquire_gpu_free(void)
-{
-    return rsx_vulkan_backend_acquire_gpu_free();
-}
-
-void rsx_d3d12_backend_note_prefix_trigger(u32 trigger)
-{
-    rsx_vulkan_backend_note_prefix_trigger((RsxD3D12PrefixTrigger)trigger);
-}
-
-void rsx_d3d12_backend_trace_texture_read_prefix(void)
-{
-    rsx_vulkan_backend_trace_texture_read_prefix();
-}
-
-int rsx_d3d12_backend_fifo_faulted(void)
-{
-    return rsx_vulkan_backend_fifo_faulted();
-}
-
-#else /* !PS3RECOMP_RSX_VULKAN: the null backend needs no boundaries at all. */
-
+/* The Vulkan backend on this branch owns its FIFO/labelling bookkeeping
+ * internally: it reads guest VRAM directly and submits per frame, so the
+ * D3D12 backend's explicit prefix boundaries have nothing to drive. They all
+ * answer the neutral value. */
 int  rsx_d3d12_backend_complete_fifo_prefix(void) { return 0; }
 int  rsx_d3d12_backend_complete_fifo_prefix_at(RsxD3D12CompletionReason reason)
 { (void)reason; return 0; }
@@ -88,7 +41,6 @@ void rsx_d3d12_backend_note_prefix_trigger(u32 trigger) { (void)trigger; }
 void rsx_d3d12_backend_trace_texture_read_prefix(void) {}
 int  rsx_d3d12_backend_fifo_faulted(void) { return 0; }
 
-#endif /* PS3RECOMP_RSX_VULKAN */
 
 /* The exact-copy capture: cellGcmSys does the CPU blit into guest VRAM and, on
  * D3D12, records the same copy so the backend's display/rendertarget ownership
@@ -116,8 +68,24 @@ void rsx_d3d12_backend_pulse_fence_wait_service(void) {}
 void rsx_d3d12_backend_snapshot_late_resolve(void) {}
 
 
-/* Backend lifecycle + frame loop: the title binds these as "the" RSX backend,
- * so on hosts without D3D12 they drive the null backend's window/frame state. */
+#if defined(PS3RECOMP_RSX_VULKAN)
+int  rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+{
+    return rsx_vulkan_backend_init(width, height, title);
+}
+void rsx_d3d12_backend_shutdown(void) { rsx_vulkan_backend_shutdown(); }
+int  rsx_d3d12_backend_pump_messages(void) { return rsx_vulkan_backend_pump_messages(); }
+void rsx_d3d12_backend_present(void) { rsx_vulkan_backend_present(); }
+
+/* Explicit-generation flip: the title names the framebuffer a completed GPU
+ * generation produced. The Vulkan backend presents the frame it has rendered,
+ * so a named buffer is a plain commit of the current one. */
+void rsx_d3d12_backend_present_buffer(u64 generation, u32 buffer_id)
+{
+    (void)generation; (void)buffer_id;
+    rsx_vulkan_backend_present();
+}
+#else
 int  rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 {
     return rsx_null_backend_init(width, height, title);
@@ -133,6 +101,7 @@ void rsx_d3d12_backend_present_buffer(u64 generation, u32 buffer_id)
     (void)generation; (void)buffer_id;
     rsx_null_backend_present();
 }
+#endif
 
 /* Survival-mode geometry trace arming (the D3D12 backend's own diagnostics). */
 void rsx_d3d12_arm_survival_trace(void) {}
