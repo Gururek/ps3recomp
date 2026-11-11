@@ -1584,7 +1584,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
      * command buffer, so ctrl->ref never advances and the game parks in its
      * reference-wait loop. 16 MB is the usual SDK local size. */
     if (ioAddress != 0 && ioSize == 0) {
-        ioSize = 0x2000000;
+        ioSize = 0x1000000;
         s_config.ioSize = ioSize;
         printf("[cellGcmSys] ioSize=0: defaulting the IO window to 0x%X at io 0 (ea 0x%08X)\n",
                ioSize, ioAddress);
@@ -3538,11 +3538,25 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
  * long lock hold with the number of paced fence publications inside it (the
  * 200us pacing x hundreds of one-ahead fences = the ~156ms holds). */
 volatile long long g_gcm_ref_pub_count = 0;
+/* The last fence value that reached the ref register. The pump's tickets are
+ * SIGNED (request 0, then request 0xFFFFFFFF = -1) and it spins while
+ * (int)ticket < (int)[ctrl+8], so once the queue runs dry ref has to KEEP the
+ * value of the fence it published: publishing put (a small byte offset) reset
+ * a satisfied -1 ticket and the pump spun again forever. */
+static volatile u32 s_ref_last_fence = 0;
+static volatile int s_ref_have_fence = 0;
+static u32 gcm_ref_dry_value(void)
+{
+    return s_ref_have_fence ? s_ref_last_fence
+                            : vm_read32(GCM_CONTROL_GUEST_ADDR + 0);   /* put */
+}
 static void gcm_ref_publish_one(void)
 {
     u32 h = s_ref_qhead;
     if (h == s_ref_qtail) return;
-    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
+    s_ref_last_fence = s_ref_q[h % GCM_REF_QLEN];
+    s_ref_have_fence = 1;
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_last_fence);
     s_ref_qhead = h + 1;
     g_gcm_ref_pub_count++;
 }
@@ -3830,8 +3844,7 @@ void cellGcm_ref_on_poll(void)
          * libgcm's ref is "how far the RSX has consumed", so with nothing
          * queued publish the FIFO's own progress. A queued fence still wins. */
         if (dry)
-            vm_write32(GCM_CONTROL_GUEST_ADDR + 8,
-                       vm_read32(GCM_CONTROL_GUEST_ADDR + 0));
+            vm_write32(GCM_CONTROL_GUEST_ADDR + 8, gcm_ref_dry_value());
     }
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
     if (dry && s_gcm_kick_ev)
@@ -4553,8 +4566,7 @@ static void gcm_rsx_process_fifo_unlocked_profiled(TjFifoPerfCall* perf_call)
      * has consumed", so when no fence is queued, publish the FIFO's own
      * progress. Additive: a queued fence always wins. */
     if (s_ref_qhead == s_ref_qtail)
-        vm_write32(GCM_CONTROL_GUEST_ADDR + 8,
-                   vm_read32(GCM_CONTROL_GUEST_ADDR + 0));   /* put */
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 8, gcm_ref_dry_value());
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
 }
 
