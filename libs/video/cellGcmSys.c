@@ -29,6 +29,10 @@ uint32_t ppu_hle_inject_base = 0x20000000u;
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
 static u32 s_gcm_context_ea = 0;
+/* io address of the title's command ring = the top of the local-memory IO
+ * window (libgcm carves the FIFO ring off the top of local memory); the GCM
+ * control block's put/get are offsets from it. Set by cellGcmInit. */
+static u32 s_fifo_io_base = 0;
 static void gcm_fifo_objects_reset(void);
 #include <stdio.h>
 #include <stdarg.h>
@@ -1580,13 +1584,19 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
      * command buffer, so ctrl->ref never advances and the game parks in its
      * reference-wait loop. 16 MB is the usual SDK local size. */
     if (ioAddress != 0 && ioSize == 0) {
-        ioSize = 0x1000000;
+        ioSize = 0x2000000;
         s_config.ioSize = ioSize;
         printf("[cellGcmSys] ioSize=0: defaulting the IO window to 0x%X at io 0 (ea 0x%08X)\n",
                ioSize, ioAddress);
     }
     if (ioAddress != 0 && ioSize > 0) {
-        populate_offset_table(ioAddress, 0, ioSize);
+        /* libgcm carves the command ring off the TOP of local memory, i.e. at
+         * io == ioSize (Tokyo Jungle's first FIFO word is an idle JUMP to
+         * io 0x01000000 with a 16 MB window, 0x02000000 with 32 MB). Register
+         * the ring's own span so gcm_io2ea() resolves it, and record it as the
+         * base that control put/get are offsets from. */
+        s_fifo_io_base = 0;
+        populate_offset_table(ioAddress, 0, ioSize + 0x20000);
 
         s_io_mappings[0].ea     = ioAddress;
         s_io_mappings[0].io     = 0;
@@ -3814,6 +3824,14 @@ void cellGcm_ref_on_poll(void)
         gcm_ref_publish_one();
         s_last_pub = now.QuadPart;
         dry = (s_ref_qhead == s_ref_qtail);
+        /* Tokyo Jungle: after the title's boot fences are all published its
+         * per-frame pump (func_001F2D88) keeps polling ref for progress. With
+         * an empty queue ref froze and the pump spent ~224 tick spins a frame.
+         * libgcm's ref is "how far the RSX has consumed", so with nothing
+         * queued publish the FIFO's own progress. A queued fence still wins. */
+        if (dry)
+            vm_write32(GCM_CONTROL_GUEST_ADDR + 8,
+                       vm_read32(GCM_CONTROL_GUEST_ADDR + 0));
     }
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
     if (dry && s_gcm_kick_ev)
@@ -4154,7 +4172,12 @@ static void gcm_rsx_process_fifo_unlocked_fast(void)
     extern u32 g_rsx_last_reference;
     if (!s_gcm_context_ea) return;
     if (!inited) { rsx_state_init(&state); depth_pass_trace = getenv("TJ_DEPTH_PASS_TRACE") != NULL; inited = 1; }
-    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    /* Tokyo Jungle lays its command ring at io 0x01000000: the first word of
+     * the region cellGcmSetupContext reserved is an idle JUMP to that base,
+     * and the control block's put/get are offsets FROM that base. Learn the
+     * base from that first jump so `put` becomes comparable with the absolute
+     * io offsets the walker carries. */
+    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0) + s_fifo_io_base;
     if (gcm_drain_debug_enabled()) { static int n = 0; if (n++ % 60 == 0)
         printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n", s_fifo_getoff, put,
                vm_read32(GCM_CONTROL_GUEST_ADDR + 8), vm_read32(s_gcm_context_ea + 0x8)); }
@@ -4185,6 +4208,11 @@ static void gcm_rsx_process_fifo_unlocked_fast(void)
         }
         if (type == 1) {
             u32 target = w & 0x1FFFFFFCu;
+            if (!s_fifo_io_base && s_fifo_getoff == 0 && target) {
+                s_fifo_io_base = target;
+                if (gcm_recdbg_enabled())
+                    fprintf(stdout, "[FIFOBASE] ring io base = %08X\n", target);
+            }
             { static int rd = -1; if (rd < 0) rd = getenv("GCM_RECDBG") ? 1 : 0; if (rd) fprintf(stdout,"[JMP] %08X -> %08X (put=%08X)\n",s_fifo_getoff,target,put); }
             if (target == s_fifo_getoff) {
                 if (gcm_recdbg_enabled()) fprintf(stdout,"[IDLE] at=%08X calloff=%08X put=%08X\n",s_fifo_getoff,s_fifo_calloff,put);
@@ -4518,6 +4546,15 @@ static void gcm_rsx_process_fifo_unlocked_profiled(TjFifoPerfCall* perf_call)
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff);              /* get */
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
+    /* Tokyo Jungle: once the title's boot fences are all published, its
+     * per-frame pump (func_001F2D88) keeps waiting on ref advancing toward the
+     * offset it just wrote. The queue is empty by then, so ref froze and the
+     * pump spent ~224 tick spins per frame. libgcm's ref is "how far the RSX
+     * has consumed", so when no fence is queued, publish the FIFO's own
+     * progress. Additive: a queued fence always wins. */
+    if (s_ref_qhead == s_ref_qtail)
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 8,
+                   vm_read32(GCM_CONTROL_GUEST_ADDR + 0));   /* put */
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
 }
 
